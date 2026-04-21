@@ -22,7 +22,6 @@ async def async_setup_entry(
 ) -> None:
     """Set up Marstek select entities based on a config entry."""
     coordinator: MarstekDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
-
     async_add_entities([MarstekOperatingModeSelect(coordinator)])
 
 
@@ -32,11 +31,11 @@ class MarstekOperatingModeSelect(CoordinatorEntity, SelectEntity):
     def __init__(self, coordinator: MarstekDataUpdateCoordinator) -> None:
         """Initialize the select entity."""
         super().__init__(coordinator)
-        
+
         device_info = coordinator.data.get("device_info", {})
         device_name = device_info.get("device", "Marstek")
         ble_mac = device_info.get("ble_mac", "unknown")
-        
+
         self._attr_unique_id = f"{ble_mac}_operating_mode"
         self._attr_name = "Operating Mode"
         self._attr_options = OPERATING_MODES
@@ -53,34 +52,35 @@ class MarstekOperatingModeSelect(CoordinatorEntity, SelectEntity):
         """Return the selected entity option to represent the entity state."""
         if "es_mode" not in self.coordinator.data:
             return None
-        
+
         mode_data = self.coordinator.data["es_mode"]
         if mode_data is None:
             return None
-            
+
         return mode_data.get("mode")
 
     async def async_select_option(self, option: str) -> None:
         """Change the selected option."""
         api = self.coordinator.api
-        
         success = False
-        
+
         if option == MODE_AUTO:
             success = await self.hass.async_add_executor_job(api.set_es_mode_auto)
+
         elif option == MODE_AI:
             success = await self.hass.async_add_executor_job(api.set_es_mode_ai)
+
         elif option == MODE_PASSIVE:
-            # Default to 100W for 300 seconds when switching to Passive mode
-            success = await self.hass.async_add_executor_job(
-                api.set_es_mode_passive, 100, 300
-            )
+            # Do not send a dummy power/countdown here.
+            # Passive power should be set explicitly via number entity or service.
+            success = True
+
         elif option == MODE_MANUAL:
-            # Default Manual mode: time_num=0, 00:00-23:59, all week, 100W, enabled
+            # Keep existing default manual behavior
             success = await self.hass.async_add_executor_job(
                 api.set_es_mode_manual, 0, "00:00", "23:59", 127, 100, 1
             )
-        
+
         if success:
             await self.coordinator.async_request_refresh()
         else:

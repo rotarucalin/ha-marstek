@@ -15,6 +15,8 @@ from .const import DOMAIN, MODE_PASSIVE
 
 _LOGGER = logging.getLogger(__name__)
 
+DEFAULT_PASSIVE_CD_TIME = 3600  # 60 minutes
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -23,7 +25,6 @@ async def async_setup_entry(
 ) -> None:
     """Set up Marstek number entities based on a config entry."""
     coordinator: MarstekDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
-
     async_add_entities([MarstekPassivePowerNumber(coordinator)])
 
 
@@ -39,11 +40,11 @@ class MarstekPassivePowerNumber(CoordinatorEntity, NumberEntity):
     def __init__(self, coordinator: MarstekDataUpdateCoordinator) -> None:
         """Initialize the number entity."""
         super().__init__(coordinator)
-        
+
         device_info = coordinator.data.get("device_info", {})
         device_name = device_info.get("device", "Marstek")
         ble_mac = device_info.get("ble_mac", "unknown")
-        
+
         self._attr_unique_id = f"{ble_mac}_passive_power"
         self._attr_name = "Passive Mode Power"
         self._attr_device_info = {
@@ -57,40 +58,45 @@ class MarstekPassivePowerNumber(CoordinatorEntity, NumberEntity):
     @property
     def native_value(self) -> float | None:
         """Return the current value."""
-        # Get the current power from es_mode if in passive mode
         if "es_mode" not in self.coordinator.data:
             return None
-        
+
         mode_data = self.coordinator.data["es_mode"]
         if mode_data is None or mode_data.get("mode") != MODE_PASSIVE:
             return None
-        
-        # Return ongrid_power as the current passive mode power
+
         return mode_data.get("ongrid_power")
+
+    async def _async_set_passive(self, value: float, cd_time: int) -> bool:
+        """Set passive mode power with custom countdown."""
+        api = self.coordinator.api
+        return await self.hass.async_add_executor_job(
+            api.set_es_mode_passive,
+            int(value),
+            int(cd_time),
+        )
 
     async def async_set_native_value(self, value: float) -> None:
         """Set new value."""
-        api = self.coordinator.api
-        
-        # Set passive mode with the new power value and default countdown of 300 seconds
-        success = await self.hass.async_add_executor_job(
-            api.set_es_mode_passive, int(value), 300
-        )
-        
+        success = await self._async_set_passive(value, DEFAULT_PASSIVE_CD_TIME)
+
         if success:
             await self.coordinator.async_request_refresh()
         else:
-            _LOGGER.error("Failed to set passive mode power to %s W", value)
+            _LOGGER.error(
+                "Failed to set passive mode power to %s W with cd_time=%s",
+                value,
+                DEFAULT_PASSIVE_CD_TIME,
+            )
 
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        # Only available when in Passive mode
         if "es_mode" not in self.coordinator.data:
             return False
-        
+
         mode_data = self.coordinator.data["es_mode"]
         if mode_data is None:
             return False
-            
+
         return mode_data.get("mode") == MODE_PASSIVE

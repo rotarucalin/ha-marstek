@@ -253,11 +253,11 @@ class MarstekSensor(CoordinatorEntity, SensorEntity):
         """Initialize the sensor."""
         super().__init__(coordinator)
         self.entity_description = description
-        
+
         device_info = coordinator.data.get("device_info", {})
         device_name = device_info.get("device", "Marstek")
         ble_mac = device_info.get("ble_mac", "unknown")
-        
+
         self._attr_unique_id = f"{ble_mac}_{description.key}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, ble_mac)},
@@ -268,14 +268,23 @@ class MarstekSensor(CoordinatorEntity, SensorEntity):
         }
 
     @property
+    def available(self) -> bool:
+        """Return whether the entity is available."""
+        key = self.entity_description.data_key
+        return (
+            super().available
+            and key is not None
+            and key in self.coordinator.data
+            and self.coordinator.data[key] is not None
+        )
+
+    @property
     def native_value(self) -> StateType:
         """Return the state of the sensor."""
-        if self.entity_description.data_key not in self.coordinator.data:
+        if not self.available:
             return None
 
         data = self.coordinator.data[self.entity_description.data_key]
-        if data is None:
-            return None
 
         if self.entity_description.value_fn:
             return self.entity_description.value_fn(data)

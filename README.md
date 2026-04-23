@@ -136,10 +136,12 @@ Create custom schedules for charging/discharging. When switching to Manual mode 
 For advanced manual scheduling, use the service calls described below.
 
 ### Passive Mode
-Direct control of battery power. Use the `number.marstek_passive_power` entity to set the desired power:
+Direct control of battery power. Use the `number.marstek_passive_power` entity or the `marstek.set_operating_mode_passive` service to control the battery:
 - Positive values: Discharge to grid
 - Negative values: Charge from grid
-- Default countdown: 300 seconds
+- Default countdown when using the number entity: 3600 seconds (1 hour)
+
+**Note**: Selecting "Passive" via the operating mode select entity does **not** automatically send a power command. You must explicitly set the desired power using the number entity or the `set_operating_mode_passive` service. This prevents unintended intermediate power values when switching modes.
 
 ## Services
 
@@ -165,6 +167,18 @@ data:
 - All week: 127
 - Calculate: Add powers of 2 (Mon=1, Tue=2, Wed=4, Thu=8, Fri=16, Sat=32, Sun=64)
 
+### marstek.set_operating_mode_passive
+
+Set passive mode with explicit power and countdown in a single call. Prefer this over the two-step approach (select mode + set number) in automations to avoid race conditions.
+
+```yaml
+service: marstek.set_operating_mode_passive
+data:
+  entity_id: select.marstek_operating_mode
+  power: 800      # Power in watts (-3000 to 3000). Positive = discharge, negative = charge.
+  cd_time: 3600   # Countdown in seconds (1 to 86400)
+```
+
 ## Automation Examples
 
 ### Charge Battery During Cheap Electricity
@@ -176,16 +190,11 @@ automation:
       - platform: time
         at: "01:00:00"
     action:
-      - service: select.select_option
-        target:
+      - service: marstek.set_operating_mode_passive
+        data:
           entity_id: select.marstek_operating_mode
-        data:
-          option: "Passive"
-      - service: number.set_value
-        target:
-          entity_id: number.marstek_passive_power
-        data:
-          value: -2000  # Charge at 2000W
+          power: -2000   # Charge at 2000W
+          cd_time: 3600  # Run for 1 hour
 ```
 
 ### Discharge to Grid During Peak Hours
@@ -197,16 +206,11 @@ automation:
       - platform: time
         at: "17:00:00"
     action:
-      - service: select.select_option
-        target:
+      - service: marstek.set_operating_mode_passive
+        data:
           entity_id: select.marstek_operating_mode
-        data:
-          option: "Passive"
-      - service: number.set_value
-        target:
-          entity_id: number.marstek_passive_power
-        data:
-          value: 1500  # Discharge at 1500W
+          power: 1500    # Discharge at 1500W
+          cd_time: 3600  # Run for 1 hour
 ```
 
 ### Return to Auto Mode
@@ -260,6 +264,8 @@ You can add the Marstek sensors to Home Assistant's Energy Dashboard:
 2. Verify the device is online in the Marstek app
 3. Reload the integration from the UI
 4. Check if Open API is still enabled
+
+**Note on data caching**: The integration caches the last known good values for each data section for up to 3 minutes (6 polling cycles at 30s intervals). If the device is briefly unreachable, entities will continue to show their last known values rather than becoming unavailable. After 3 minutes without a successful response, entities will report as unavailable.
 
 ### Enable Debug Logging
 

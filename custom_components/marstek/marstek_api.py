@@ -2,7 +2,6 @@
 import json
 import logging
 import socket
-from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,43 +24,44 @@ class MarstekAPI:
         return self._request_id
 
     def _send_request(self, method: str, params: dict | None = None) -> dict | None:
-    if params is None:
-        params = {"id": 0}
+        """Send a UDP JSON-RPC request."""
+        if params is None:
+            params = {"id": 0}
 
-    request = {
-        "id": self._get_next_id(),
-        "method": method,
-        "params": params,
-    }
+        request = {
+            "id": self._get_next_id(),
+            "method": method,
+            "params": params,
+        }
 
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.settimeout(self.timeout)
-            message = json.dumps(request).encode("utf-8")
-            sock.sendto(message, (self.host, self.port))
-            data, _ = sock.recvfrom(4096)
-            response = json.loads(data.decode("utf-8"))
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(self.timeout)
+                message = json.dumps(request).encode("utf-8")
+                sock.sendto(message, (self.host, self.port))
+                data, _ = sock.recvfrom(4096)
+                response = json.loads(data.decode("utf-8"))
 
-        if "error" in response:
-            _LOGGER.error(
-                "API error: %s - %s",
-                response["error"].get("code"),
-                response["error"].get("message"),
-            )
+            if "error" in response:
+                _LOGGER.error(
+                    "API error: %s - %s",
+                    response["error"].get("code"),
+                    response["error"].get("message"),
+                )
+                return None
+
+            return response.get("result")
+
+        except socket.timeout:
+            _LOGGER.error("Timeout communicating with device at %s:%s", self.host, self.port)
+            return None
+        except json.JSONDecodeError as err:
+            _LOGGER.error("Failed to decode JSON response: %s", err)
+            return None
+        except Exception as err:
+            _LOGGER.error("Error communicating with device: %s", err)
             return None
 
-        return response.get("result")
-
-    except socket.timeout:
-        _LOGGER.error("Timeout communicating with device at %s:%s", self.host, self.port)
-        return None
-    except json.JSONDecodeError as err:
-        _LOGGER.error("Failed to decode JSON response: %s", err)
-        return None
-    except Exception as err:
-        _LOGGER.error("Error communicating with device: %s", err)
-        return None
-        
     def discover_devices(self, broadcast_address: str = "255.255.255.255") -> list[dict]:
         """Discover Marstek devices on the network."""
         request = {
@@ -71,28 +71,27 @@ class MarstekAPI:
         }
 
         devices = []
+
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            sock.settimeout(self.timeout)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.settimeout(self.timeout)
 
-            # Send broadcast
-            message = json.dumps(request).encode("utf-8")
-            sock.sendto(message, (broadcast_address, self.port))
+                message = json.dumps(request).encode("utf-8")
+                sock.sendto(message, (broadcast_address, self.port))
 
-            # Collect responses
-            try:
-                while True:
-                    data, addr = sock.recvfrom(4096)
-                    response = json.loads(data.decode("utf-8"))
-                    if "result" in response:
-                        device_info = response["result"]
-                        device_info["ip"] = addr[0]
-                        devices.append(device_info)
-            except socket.timeout:
-                pass  # Expected when no more responses
+                try:
+                    while True:
+                        data, addr = sock.recvfrom(4096)
+                        response = json.loads(data.decode("utf-8"))
 
-            sock.close()
+                        if "result" in response:
+                            device_info = response["result"]
+                            device_info["ip"] = addr[0]
+                            devices.append(device_info)
+
+                except socket.timeout:
+                    pass
 
         except Exception as err:
             _LOGGER.error("Error during device discovery: %s", err)

@@ -9,7 +9,7 @@ from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_component import EntityComponent
 
-from .const import DOMAIN, MODE_PASSIVE
+from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -33,7 +33,6 @@ async def async_register_services(
     async def async_handle_set_operating_mode_passive(call: ServiceCall) -> None:
         entity_id = call.data["entity_id"]
         power = call.data["power"]
-        cd_time = call.data["cd_time"]
 
         # Find coordinator through loaded config entries
         domain_data = hass.data.get(DOMAIN, {})
@@ -59,21 +58,11 @@ async def async_register_services(
             _LOGGER.error("Could not resolve Marstek device for entity_id=%s", entity_id)
             return
 
-        api = coordinator.api
-        success = await hass.async_add_executor_job(
-            api.set_es_mode_passive,
-            power,
-            cd_time,
-        )
-
-        if success:
-            await coordinator.async_request_refresh()
-        else:
+        if not await coordinator.async_set_passive_power(power):
             _LOGGER.error(
-                "Failed to set passive mode for %s: power=%s cd_time=%s",
+                "Failed to set passive mode for %s: power=%s",
                 entity_id,
                 power,
-                cd_time,
             )
 
     if not hass.services.has_service(DOMAIN, SERVICE_SET_OPERATING_MODE_PASSIVE):

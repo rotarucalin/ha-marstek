@@ -1,6 +1,6 @@
 set_operating_mode_passive:
   name: Set passive mode
-  description: Set Marstek battery system to passive mode with power and countdown.
+  description: Set and maintain Marstek battery system passive mode power.
   fields:
     entity_id:
       name: Entity ID
@@ -23,7 +23,7 @@ set_operating_mode_passive:
           mode: box
     cd_time:
       name: Countdown
-      description: Countdown in seconds.
+      description: Retained for compatibility and ignored by the integration.
       required: true
       example: 3600
       selector:

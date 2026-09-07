@@ -7,9 +7,9 @@ A custom Home Assistant integration for Marstek battery systems (Venus C, Venus 
 - 📊 **Real-time Monitoring**: Battery SOC, power, temperature, and capacity
 - ⚡ **Energy Tracking**: Solar generation, grid import/export, load consumption
 - 🔋 **Battery Control**: Charging and discharging status
-- 🌐 **Network Status**: WiFi signal strength and connectivity
+- &#x1F310; **Network Status**: WiFi signal strength and connectivity
 - 📈 **Energy Meter**: CT sensor support for 3-phase power monitoring
-- 🎛️ **Operating Modes**: Auto, AI, Manual, and Passive control modes
+- &#x1F39B;&#xFE0F; **Operating Modes**: Auto, AI, Manual, and Passive control modes
 - 🔌 **Local Control**: Works entirely on your local network (no cloud required)
 
 ## Supported Devices
@@ -95,6 +95,7 @@ The integration creates the following entities:
 - `sensor.marstek_total_grid_input_energy` - Cumulative grid import (Wh)
 - `sensor.marstek_total_load_energy` - Cumulative load consumption (Wh)
 - `sensor.marstek_operating_mode` - Current operating mode
+- `sensor.marstek_passive_power_state` - Passive power control state: `unknown`, `sent`, `acknowledged`, or `retrying`
 
 **Energy Meter (if CT connected)**
 - `sensor.marstek_total_meter_power` - Total power from CT (W)
@@ -139,7 +140,8 @@ For advanced manual scheduling, use the service calls described below.
 Direct control of battery power. Use the `number.marstek_passive_power` entity or the `marstek.set_operating_mode_passive` service to control the battery:
 - Positive values: Discharge to grid
 - Negative values: Charge from grid
-- Default countdown when using the number entity: 3600 seconds (1 hour)
+- The integration resends the configured power every 180 seconds to work around the device's passive-mode timeout.
+- `sensor.marstek_passive_power_state` reports whether the target is `sent` (awaiting confirmation), `acknowledged` (confirmed within tolerance), `retrying` (confirmation failed, resent), or `unknown` (no target maintained).
 
 **Note**: Selecting "Passive" via the operating mode select entity does **not** automatically send a power command. You must explicitly set the desired power using the number entity or the `set_operating_mode_passive` service. This prevents unintended intermediate power values when switching modes.
 
@@ -169,14 +171,14 @@ data:
 
 ### marstek.set_operating_mode_passive
 
-Set passive mode with explicit power and countdown in a single call. Prefer this over the two-step approach (select mode + set number) in automations to avoid race conditions.
+Set and maintain passive mode power in a single call. Prefer this over the two-step approach (select mode + set number) in automations to avoid race conditions.
 
 ```yaml
 service: marstek.set_operating_mode_passive
 data:
   entity_id: select.marstek_operating_mode
   power: 800      # Power in watts (-3000 to 3000). Positive = discharge, negative = charge.
-  cd_time: 3600   # Countdown in seconds (1 to 86400)
+  cd_time: 3600   # Retained for compatibility; ignored by the integration.
 ```
 
 ## Automation Examples

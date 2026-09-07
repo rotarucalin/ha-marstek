@@ -61,25 +61,7 @@ class MarstekOperatingModeSelect(CoordinatorEntity, SelectEntity):
 
     async def async_select_option(self, option: str) -> None:
         """Change the selected option."""
-        api = self.coordinator.api
-        success = False
-
-        if option == MODE_AUTO:
-            success = await self.hass.async_add_executor_job(api.set_es_mode_auto)
-
-        elif option == MODE_AI:
-            success = await self.hass.async_add_executor_job(api.set_es_mode_ai)
-
-        elif option == MODE_PASSIVE:
-            # Do not send a dummy power/countdown here.
-            # Passive power should be set explicitly via number entity or service.
-            success = True
-
-        elif option == MODE_MANUAL:
-            # Keep existing default manual behavior
-            success = await self.hass.async_add_executor_job(
-                api.set_es_mode_manual, 0, "00:00", "23:59", 127, 100, 1
-            )
+        success = await self.coordinator.async_set_operating_mode(option)
 
         if success:
             await self.coordinator.async_request_refresh()

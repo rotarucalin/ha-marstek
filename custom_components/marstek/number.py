@@ -15,8 +15,6 @@ from .const import DOMAIN, MODE_PASSIVE
 
 _LOGGER = logging.getLogger(__name__)
 
-DEFAULT_PASSIVE_CD_TIME = 3600  # 60 minutes
-
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -67,27 +65,12 @@ class MarstekPassivePowerNumber(CoordinatorEntity, NumberEntity):
 
         return mode_data.get("ongrid_power")
 
-    async def _async_set_passive(self, value: float, cd_time: int) -> bool:
-        """Set passive mode power with custom countdown."""
-        api = self.coordinator.api
-        return await self.hass.async_add_executor_job(
-            api.set_es_mode_passive,
-            int(value),
-            int(cd_time),
-        )
-
     async def async_set_native_value(self, value: float) -> None:
         """Set new value."""
-        success = await self._async_set_passive(value, DEFAULT_PASSIVE_CD_TIME)
+        success = await self.coordinator.async_set_passive_power(int(value))
 
-        if success:
-            await self.coordinator.async_request_refresh()
-        else:
-            _LOGGER.error(
-                "Failed to set passive mode power to %s W with cd_time=%s",
-                value,
-                DEFAULT_PASSIVE_CD_TIME,
-            )
+        if not success:
+            _LOGGER.error("Failed to set passive mode power to %s W", value)
 
     @property
     def available(self) -> bool:

@@ -181,7 +181,7 @@ class MarstekAPI:
         result = self._send_request("ES.SetMode", params)
         return result is not None and result.get("set_result", False)
 
-    def set_es_mode_passive(self, power: int, cd_time: int = 300) -> bool:
+    def set_es_mode_passive(self, power: int, cd_time: int = 3600) -> bool:
         """Set energy system to Passive mode."""
         params = {
             "id": 0,

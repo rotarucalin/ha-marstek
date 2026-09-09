@@ -7,6 +7,7 @@ import voluptuous as vol
 
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_component import EntityComponent
 
 from .const import DOMAIN
@@ -34,28 +35,22 @@ async def async_register_services(
         entity_id = call.data["entity_id"]
         power = call.data["power"]
 
-        # Find coordinator through loaded config entries
-        domain_data = hass.data.get(DOMAIN, {})
         coordinator = None
-
-        for entry_id, entry_coordinator in domain_data.items():
-            try:
-                select_entity_id = f"select.{entry_coordinator.data['device_info']['device'].lower()}_battery_system_operating_mode"
-            except Exception:
-                select_entity_id = None
-
-            # Fallback: just accept first coordinator if only one device exists
-            if len(domain_data) == 1:
-                coordinator = entry_coordinator
-                break
-
-            # If you want exact entity_id mapping, improve this part later
-            if select_entity_id == entity_id:
-                coordinator = entry_coordinator
-                break
+        entity_entry = er.async_get(hass).async_get(entity_id)
+        if (
+            entity_entry is not None
+            and entity_entry.platform == DOMAIN
+            and entity_entry.config_entry_id is not None
+        ):
+            coordinator = hass.data.get(DOMAIN, {}).get(
+                entity_entry.config_entry_id
+            )
 
         if coordinator is None:
-            _LOGGER.error("Could not resolve Marstek device for entity_id=%s", entity_id)
+            _LOGGER.error(
+                "Could not resolve Marstek device for entity_id=%s",
+                entity_id,
+            )
             return
 
         if not await coordinator.async_set_passive_power(power):

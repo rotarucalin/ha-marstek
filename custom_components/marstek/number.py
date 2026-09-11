@@ -1,4 +1,5 @@
 """Support for Marstek Battery System number entities."""
+
 from __future__ import annotations
 
 import logging
@@ -8,10 +9,10 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfPower
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import MarstekDataUpdateCoordinator
 from .const import DOMAIN, MODE_PASSIVE
+from .entity import MarstekEntity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ async def async_setup_entry(
     async_add_entities([MarstekPassivePowerNumber(coordinator)])
 
 
-class MarstekPassivePowerNumber(CoordinatorEntity, NumberEntity):
+class MarstekPassivePowerNumber(MarstekEntity, NumberEntity):
     """Representation of Marstek passive mode power setting."""
 
     _attr_mode = NumberMode.BOX
@@ -37,21 +38,8 @@ class MarstekPassivePowerNumber(CoordinatorEntity, NumberEntity):
 
     def __init__(self, coordinator: MarstekDataUpdateCoordinator) -> None:
         """Initialize the number entity."""
-        super().__init__(coordinator)
-
-        device_info = coordinator.data.get("device_info", {})
-        device_name = device_info.get("device", "Marstek")
-        ble_mac = device_info.get("ble_mac", "unknown")
-
-        self._attr_unique_id = f"{ble_mac}_passive_power"
+        super().__init__(coordinator, "passive_power")
         self._attr_name = "Passive Mode Power"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, ble_mac)},
-            "name": f"{device_name} Battery System",
-            "manufacturer": "Marstek",
-            "model": device_info.get("device", "Unknown"),
-            "sw_version": str(device_info.get("ver", "")),
-        }
 
     @property
     def native_value(self) -> float | None:
@@ -75,7 +63,7 @@ class MarstekPassivePowerNumber(CoordinatorEntity, NumberEntity):
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        if "es_mode" not in self.coordinator.data:
+        if not super().available or "es_mode" not in self.coordinator.data:
             return False
 
         mode_data = self.coordinator.data["es_mode"]

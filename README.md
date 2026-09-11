@@ -2,6 +2,23 @@
 
 A custom Home Assistant integration for Marstek battery systems (Venus C, Venus E, Venus D) using the local UDP API.
 
+## Device identity and multiple batteries
+
+Add each physical battery as a separate integration entry using its own IP
+address. The integration identifies batteries by their BLE MAC address, so two
+batteries of the same model remain separate and commands target the battery
+owning the selected entity. A temporary failure to read device information at
+startup reuses the saved identity and metadata. Entries without a valid identity
+wait for Home Assistant to retry setup.
+
+On the first successful setup after updating, the integration repairs device and
+entity records created with an `unknown`, empty, or `None` identity. A lone
+placeholder is corrected in place, preserving entity IDs and device IDs. When
+both placeholder and real-MAC records exist, the real records are retained and
+duplicate placeholder records are removed. Home Assistant logs the removed and
+retained IDs; update any dashboard or automation that referenced a removed
+duplicate. Migration only handles records owned by the relevant config entry.
+
 ## Features
 
 - 📊 **Real-time Monitoring**: Battery SOC, power, temperature, and capacity

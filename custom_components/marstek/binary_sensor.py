@@ -1,9 +1,10 @@
 """Support for Marstek Battery System binary sensors."""
+
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-import logging
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
@@ -13,10 +14,10 @@ from homeassistant.components.binary_sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import MarstekDataUpdateCoordinator
 from .const import DOMAIN
+from .entity import MarstekEntity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -75,7 +76,7 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class MarstekBinarySensor(CoordinatorEntity, BinarySensorEntity):
+class MarstekBinarySensor(MarstekEntity, BinarySensorEntity):
     """Representation of a Marstek binary sensor."""
 
     entity_description: MarstekBinarySensorEntityDescription
@@ -86,21 +87,8 @@ class MarstekBinarySensor(CoordinatorEntity, BinarySensorEntity):
         description: MarstekBinarySensorEntityDescription,
     ) -> None:
         """Initialize the binary sensor."""
-        super().__init__(coordinator)
+        super().__init__(coordinator, description.key)
         self.entity_description = description
-
-        device_info = coordinator.data.get("device_info", {})
-        device_name = device_info.get("device", "Marstek")
-        ble_mac = device_info.get("ble_mac", "unknown")
-
-        self._attr_unique_id = f"{ble_mac}_{description.key}"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, ble_mac)},
-            "name": f"{device_name} Battery System",
-            "manufacturer": "Marstek",
-            "model": device_info.get("device", "Unknown"),
-            "sw_version": str(device_info.get("ver", "")),
-        }
 
     @property
     def available(self) -> bool:

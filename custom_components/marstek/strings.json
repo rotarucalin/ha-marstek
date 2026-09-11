@@ -12,6 +12,7 @@
     },
     "error": {
       "cannot_connect": "Failed to connect to the device. Please check the IP address and ensure the Open API is enabled in the Marstek app.",
+      "invalid_identity": "The device did not return a valid BLE MAC address. Please try again when the device is ready.",
       "unknown": "Unexpected error occurred."
     },
     "abort": {

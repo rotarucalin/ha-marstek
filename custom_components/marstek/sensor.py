@@ -1,9 +1,10 @@
 """Support for Marstek Battery System sensors."""
+
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-import logging
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -23,10 +24,10 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import MarstekDataUpdateCoordinator
 from .const import DOMAIN, PASSIVE_POWER_STATES
+from .entity import MarstekEntity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -241,7 +242,7 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class MarstekSensor(CoordinatorEntity, SensorEntity):
+class MarstekSensor(MarstekEntity, SensorEntity):
     """Representation of a Marstek sensor."""
 
     entity_description: MarstekSensorEntityDescription
@@ -252,21 +253,8 @@ class MarstekSensor(CoordinatorEntity, SensorEntity):
         description: MarstekSensorEntityDescription,
     ) -> None:
         """Initialize the sensor."""
-        super().__init__(coordinator)
+        super().__init__(coordinator, description.key)
         self.entity_description = description
-
-        device_info = coordinator.data.get("device_info", {})
-        device_name = device_info.get("device", "Marstek")
-        ble_mac = device_info.get("ble_mac", "unknown")
-
-        self._attr_unique_id = f"{ble_mac}_{description.key}"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, ble_mac)},
-            "name": f"{device_name} Battery System",
-            "manufacturer": "Marstek",
-            "model": device_info.get("device", "Unknown"),
-            "sw_version": str(device_info.get("ver", "")),
-        }
 
     @property
     def available(self) -> bool:
@@ -293,7 +281,7 @@ class MarstekSensor(CoordinatorEntity, SensorEntity):
         return None
 
 
-class MarstekPassivePowerStateSensor(CoordinatorEntity, SensorEntity):
+class MarstekPassivePowerStateSensor(MarstekEntity, SensorEntity):
     """Representation of the Marstek passive power control state."""
 
     _attr_device_class = SensorDeviceClass.ENUM
@@ -301,21 +289,8 @@ class MarstekPassivePowerStateSensor(CoordinatorEntity, SensorEntity):
 
     def __init__(self, coordinator: MarstekDataUpdateCoordinator) -> None:
         """Initialize the sensor."""
-        super().__init__(coordinator)
-
-        device_info = coordinator.data.get("device_info", {})
-        device_name = device_info.get("device", "Marstek")
-        ble_mac = device_info.get("ble_mac", "unknown")
-
-        self._attr_unique_id = f"{ble_mac}_passive_power_state"
+        super().__init__(coordinator, "passive_power_state")
         self._attr_name = "Passive Power State"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, ble_mac)},
-            "name": f"{device_name} Battery System",
-            "manufacturer": "Marstek",
-            "model": device_info.get("device", "Unknown"),
-            "sw_version": str(device_info.get("ver", "")),
-        }
 
     @property
     def native_value(self) -> StateType:

@@ -1,4 +1,5 @@
 """Support for Marstek Battery System select entities."""
+
 from __future__ import annotations
 
 import logging
@@ -7,10 +8,10 @@ from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import MarstekDataUpdateCoordinator
-from .const import DOMAIN, MODE_AI, MODE_AUTO, MODE_MANUAL, MODE_PASSIVE, OPERATING_MODES
+from .const import DOMAIN, OPERATING_MODES
+from .entity import MarstekEntity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,27 +26,14 @@ async def async_setup_entry(
     async_add_entities([MarstekOperatingModeSelect(coordinator)])
 
 
-class MarstekOperatingModeSelect(CoordinatorEntity, SelectEntity):
+class MarstekOperatingModeSelect(MarstekEntity, SelectEntity):
     """Representation of Marstek operating mode select."""
 
     def __init__(self, coordinator: MarstekDataUpdateCoordinator) -> None:
         """Initialize the select entity."""
-        super().__init__(coordinator)
-
-        device_info = coordinator.data.get("device_info", {})
-        device_name = device_info.get("device", "Marstek")
-        ble_mac = device_info.get("ble_mac", "unknown")
-
-        self._attr_unique_id = f"{ble_mac}_operating_mode"
+        super().__init__(coordinator, "operating_mode")
         self._attr_name = "Operating Mode"
         self._attr_options = OPERATING_MODES
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, ble_mac)},
-            "name": f"{device_name} Battery System",
-            "manufacturer": "Marstek",
-            "model": device_info.get("device", "Unknown"),
-            "sw_version": str(device_info.get("ver", "")),
-        }
 
     @property
     def current_option(self) -> str | None:

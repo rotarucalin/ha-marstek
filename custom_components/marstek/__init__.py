@@ -1,4 +1,5 @@
 """The Marstek Battery System integration."""
+
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +10,7 @@ from datetime import timedelta
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -23,7 +25,9 @@ from .const import (
     PASSIVE_STATE_SENT,
     PASSIVE_STATE_UNKNOWN,
 )
+from .identity import CONF_DEVICE_INFO, device_metadata, normalize_mac
 from .marstek_api import MarstekAPI
+from .registry import async_repair_registry
 from .services import async_register_services
 
 _LOGGER = logging.getLogger(__name__)
@@ -53,6 +57,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = MarstekDataUpdateCoordinator(hass, api, entry)
     await coordinator.async_config_entry_first_refresh()
 
+    coordinator.registry_device_id = async_repair_registry(
+        hass, entry, coordinator.device_id, coordinator.registry_device_info
+    )
+
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
     await async_register_services(hass)
@@ -80,7 +88,31 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         """Initialize."""
         self.api = api
         self.entry = entry
-        self.device_info = None
+        # Retain the exact stored spelling so existing entity IDs remain stable.
+        self.device_id = entry.unique_id if normalize_mac(entry.unique_id) else None
+        cached_info = entry.data.get(CONF_DEVICE_INFO, {})
+        self.device_info = (
+            device_metadata(cached_info) if isinstance(cached_info, dict) else {}
+        )
+        self.registry_device_id: str | None = None
+        self._device_info_fetched = False
+        self._identity_mismatch = False
+        if self.device_id is not None:
+            self.device_info["ble_mac"] = self.device_id
+            # Older entries stored only host/port. Recover their display metadata
+            # from the real device if GetDevice is unavailable at startup.
+            for device in dr.async_entries_for_config_entry(
+                dr.async_get(hass), entry.entry_id
+            ):
+                if any(
+                    domain == DOMAIN
+                    and normalize_mac(identifier) == normalize_mac(self.device_id)
+                    for domain, identifier in device.identifiers
+                ):
+                    if device.model and device.model != "Unknown":
+                        self.device_info.setdefault("device", device.model)
+                    if device.sw_version:
+                        self.device_info.setdefault("ver", device.sw_version)
         self._last_good_data: dict = {}
         self._missing_cycles: dict[str, int] = {}
         self._passive_power_target: int | None = None
@@ -93,8 +125,82 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             hass,
             _LOGGER,
             name=DOMAIN,
+            config_entry=entry,
             update_interval=SCAN_INTERVAL,
         )
+
+    @property
+    def registry_device_info(self) -> dr.DeviceInfo:
+        """Describe this battery without deriving its identity from polling data."""
+        if self.device_id is None:
+            raise ValueError("Marstek device identity has not been established")
+        info = dr.DeviceInfo(
+            identifiers={(DOMAIN, self.device_id)},
+            name=f"{self.device_info.get('device', 'Marstek')} Battery System",
+            manufacturer="Marstek",
+        )
+        if model := self.device_info.get("device"):
+            info["model"] = str(model)
+        if self.device_info.get("ver") is not None:
+            info["sw_version"] = str(self.device_info["ver"])
+        return info
+
+    async def _async_refresh_device_info(self) -> None:
+        """Refresh metadata, retrying misses without changing a saved identity."""
+        if self._device_info_fetched:
+            return
+        info = await self.hass.async_add_executor_job(self.api.get_device_info)
+        reported_id = (
+            normalize_mac(info.get("ble_mac")) if isinstance(info, dict) else None
+        )
+        if reported_id is not None:
+            if self.device_id is not None and reported_id != normalize_mac(
+                self.device_id
+            ):
+                self._identity_mismatch = True
+                await self.async_stop_passive_control()
+                raise UpdateFailed(
+                    "The configured address belongs to a different Marstek battery"
+                )
+            if self.device_id is None:
+                if any(
+                    other.entry_id != self.entry.entry_id
+                    and normalize_mac(other.unique_id) == reported_id
+                    for other in self.hass.config_entries.async_entries(DOMAIN)
+                ):
+                    raise UpdateFailed(
+                        "This Marstek battery is already configured in another entry"
+                    )
+                self.device_id = reported_id
+            self.device_info.update(device_metadata(info))
+            self.device_info["ble_mac"] = self.device_id
+            self._device_info_fetched = bool(self.device_info.get("device"))
+            self._identity_mismatch = False
+            if (
+                self.entry.data.get(CONF_DEVICE_INFO) != self.device_info
+                or self.entry.unique_id != self.device_id
+            ):
+                self.hass.config_entries.async_update_entry(
+                    self.entry,
+                    unique_id=self.device_id,
+                    data={**self.entry.data, CONF_DEVICE_INFO: dict(self.device_info)},
+                )
+            if self.registry_device_id is not None:
+                metadata = dict(self.registry_device_info)
+                metadata.pop("identifiers")
+                dr.async_get(self.hass).async_update_device(
+                    self.registry_device_id, **metadata
+                )
+        if self._identity_mismatch:
+            raise UpdateFailed(
+                "Waiting for the configured Marstek battery identity to be verified"
+            )
+        if self.device_id is None:
+            # first_refresh converts this to ConfigEntryNotReady. No platform
+            # may create entities before a usable identity has been obtained.
+            raise UpdateFailed(
+                "No valid Marstek BLE MAC available; retrying device setup"
+            )
 
     @property
     def passive_power_state(self) -> str:
@@ -111,6 +217,8 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
     async def async_set_passive_power(self, power: int) -> bool:
         """Set and maintain a passive mode power target."""
         async with self._passive_command_lock:
+            if self._identity_mismatch:
+                return False
             self._passive_power_target = power
             self._passive_control_generation += 1
             self._cancel_passive_keepalive()
@@ -119,6 +227,8 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
     async def async_set_operating_mode(self, mode: str) -> bool:
         """Set an operating mode, superseding any passive power target."""
         async with self._passive_command_lock:
+            if self._identity_mismatch:
+                return False
             if mode == MODE_PASSIVE:
                 return True
 
@@ -256,13 +366,8 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         try:
             data = {}
 
-            if self.device_info is None:
-                self.device_info = await self.hass.async_add_executor_job(
-                    self.api.get_device_info
-                )
-
-            if self.device_info is not None:
-                data["device_info"] = self.device_info
+            await self._async_refresh_device_info()
+            data["device_info"] = dict(self.device_info)
 
             wifi_status = await self._fetch_section("wifi", self.api.get_wifi_status)
             if wifi_status is not None:
@@ -272,7 +377,9 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             if ble_status is not None:
                 data["ble"] = ble_status
 
-            bat_status = await self._fetch_section("battery", self.api.get_battery_status)
+            bat_status = await self._fetch_section(
+                "battery", self.api.get_battery_status
+            )
             if bat_status is not None:
                 data["battery"] = bat_status
 

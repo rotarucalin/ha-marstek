@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import logging
-
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfPower
@@ -13,8 +11,6 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from . import MarstekDataUpdateCoordinator
 from .const import DOMAIN, MODE_PASSIVE
 from .entity import MarstekEntity
-
-_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -55,10 +51,7 @@ class MarstekPassivePowerNumber(MarstekEntity, NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         """Set new value."""
-        success = await self.coordinator.async_set_passive_power(int(value))
-
-        if not success:
-            _LOGGER.error("Failed to set passive mode power to %s W", value)
+        await self.coordinator.async_set_passive_power(int(value))
 
     @property
     def available(self) -> bool:

@@ -157,10 +157,22 @@ For advanced manual scheduling, use the service calls described below.
 Direct control of battery power. Use the `number.marstek_passive_power` entity or the `marstek.set_operating_mode_passive` service to control the battery:
 - Positive values: Discharge to grid
 - Negative values: Charge from grid
-- The integration resends the configured power every 180 seconds to work around the device's passive-mode timeout.
+- The integration resends the configured power every 180 seconds to work around the device's passive-mode timeout. A failed send retains the target and retries after 15 seconds, repeating until a command succeeds and restores the normal 180-second cadence. This also covers failed initial commands and poll-driven verification resends.
 - `sensor.marstek_passive_power_state` reports whether the target is `sent` (awaiting confirmation), `acknowledged` (confirmed within tolerance), `retrying` (confirmation failed, resent), or `unknown` (no target maintained).
 
 **Note**: Selecting "Passive" via the operating mode select entity does **not** automatically send a power command. You must explicitly set the desired power using the number entity or the `set_operating_mode_passive` service. This prevents unintended intermediate power values when switching modes.
+
+Only one Passive keepalive/retry timer is maintained per battery. New commands replace the pending timer and invalidate queued callbacks; retries use the current target. Selecting another operating mode, stopping Passive control, or unloading the integration cancels maintenance. No automation retry loop is needed. The Passive Power number continues to report the device's `ongrid_power`, separately from the maintained target.
+
+Enable `custom_components.marstek: debug` in Home Assistant's logger configuration to trace operating-mode commands. Each outgoing `ES.SetMode` command and its result include the device name, BLE MAC, host/port, mode, power (when applicable), and source:
+
+- `new_target`: a target supplied through the Passive service or number entity.
+- `keepalive`: the normal periodic refresh.
+- `keepalive_retry`: a timer retry following a failed Passive send.
+- `verification_retry`: a resend after fresh polling data fails to confirm the target.
+- `operating_mode_select`: an explicit Auto, AI, or Manual selection.
+
+Successful traffic and the next timer's source/delay are logged at DEBUG. A failed command produces one WARNING with the next action; underlying transport/protocol errors add DEBUG details. A command is logged as successful only when the API returns a truthy `set_result`. Confirmation of reported mode/power remains a separate polling step.
 
 ## Services
 

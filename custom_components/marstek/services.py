@@ -1,10 +1,10 @@
 """Service handlers for the Marstek integration."""
+
 from __future__ import annotations
 
 import logging
 
 import voluptuous as vol
-
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
@@ -42,9 +42,7 @@ async def async_register_services(
             and entity_entry.platform == DOMAIN
             and entity_entry.config_entry_id is not None
         ):
-            coordinator = hass.data.get(DOMAIN, {}).get(
-                entity_entry.config_entry_id
-            )
+            coordinator = hass.data.get(DOMAIN, {}).get(entity_entry.config_entry_id)
 
         if coordinator is None:
             _LOGGER.error(
@@ -53,12 +51,7 @@ async def async_register_services(
             )
             return
 
-        if not await coordinator.async_set_passive_power(power):
-            _LOGGER.error(
-                "Failed to set passive mode for %s: power=%s",
-                entity_id,
-                power,
-            )
+        await coordinator.async_set_passive_power(power)
 
     if not hass.services.has_service(DOMAIN, SERVICE_SET_OPERATING_MODE_PASSIVE):
         hass.services.async_register(

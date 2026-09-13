@@ -1,4 +1,5 @@
 """Marstek API implementation using UDP JSON-RPC protocol."""
+
 import json
 import logging
 import socket
@@ -23,6 +24,17 @@ class MarstekAPI:
         self._request_id += 1
         return self._request_id
 
+    def _log_request_error(self, method: str, error: str) -> None:
+        """Keep mode-request details at DEBUG; the coordinator logs recovery."""
+        _LOGGER.log(
+            logging.DEBUG if method == "ES.SetMode" else logging.ERROR,
+            "Marstek request failed: host=%s port=%s method=%s error=%s",
+            self.host,
+            self.port,
+            method,
+            error,
+        )
+
     def _send_request(self, method: str, params: dict | None = None) -> dict | None:
         """Send a UDP JSON-RPC request."""
         if params is None:
@@ -43,26 +55,28 @@ class MarstekAPI:
                 response = json.loads(data.decode("utf-8"))
 
             if "error" in response:
-                _LOGGER.error(
-                    "API error: %s - %s",
-                    response["error"].get("code"),
-                    response["error"].get("message"),
+                self._log_request_error(
+                    method,
+                    f"API error: {response['error'].get('code')} - "
+                    f"{response['error'].get('message')}",
                 )
                 return None
 
             return response.get("result")
 
-        except socket.timeout:
-            _LOGGER.error("Timeout communicating with device at %s:%s", self.host, self.port)
+        except TimeoutError:
+            self._log_request_error(method, "Timeout communicating with device")
             return None
         except json.JSONDecodeError as err:
-            _LOGGER.error("Failed to decode JSON response: %s", err)
+            self._log_request_error(method, f"Failed to decode JSON response: {err}")
             return None
-        except Exception as err:
-            _LOGGER.error("Error communicating with device: %s", err)
+        except Exception as err:  # noqa: BLE001 - Preserve the best-effort API contract.
+            self._log_request_error(method, f"{type(err).__name__}: {err}")
             return None
 
-    def discover_devices(self, broadcast_address: str = "255.255.255.255") -> list[dict]:
+    def discover_devices(
+        self, broadcast_address: str = "255.255.255.255"
+    ) -> list[dict]:
         """Discover Marstek devices on the network."""
         request = {
             "id": self._get_next_id(),
@@ -90,10 +104,10 @@ class MarstekAPI:
                             device_info["ip"] = addr[0]
                             devices.append(device_info)
 
-                except socket.timeout:
+                except TimeoutError:
                     pass
 
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001 - Discovery returns any devices found.
             _LOGGER.error("Error during device discovery: %s", err)
 
         return devices

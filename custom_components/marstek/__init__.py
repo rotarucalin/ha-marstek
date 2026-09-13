@@ -41,6 +41,7 @@ PLATFORMS: list[Platform] = [
 
 SCAN_INTERVAL = timedelta(seconds=30)
 PASSIVE_POWER_KEEPALIVE_SECONDS = 180
+PASSIVE_POWER_RETRY_SECONDS = 15
 PASSIVE_POWER_TOLERANCE = 0.20
 PASSIVE_POWER_ZERO_TOLERANCE = 10
 
@@ -218,72 +219,150 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         """Set and maintain a passive mode power target."""
         async with self._passive_command_lock:
             if self._identity_mismatch:
+                _LOGGER.warning(
+                    "Marstek command blocked: device=%s source=new_target "
+                    "mode=Passive power=%sW error=device identity mismatch",
+                    self.entry.title,
+                    power,
+                )
                 return False
             self._passive_power_target = power
-            self._passive_control_generation += 1
-            self._cancel_passive_keepalive()
-            return await self._async_send_passive_power(PASSIVE_STATE_SENT)
+            return await self._async_send_passive_power(
+                PASSIVE_STATE_SENT, source="new_target"
+            )
 
-    async def async_set_operating_mode(self, mode: str) -> bool:
+    async def async_set_operating_mode(
+        self, mode: str, *, source: str = "operating_mode_select"
+    ) -> bool:
         """Set an operating mode, superseding any passive power target."""
         async with self._passive_command_lock:
             if self._identity_mismatch:
+                _LOGGER.warning(
+                    "Marstek command blocked: device=%s source=%s mode=%s "
+                    "error=device identity mismatch",
+                    self.entry.title,
+                    source,
+                    mode,
+                )
                 return False
             if mode == MODE_PASSIVE:
                 return True
 
             self._clear_passive_control()
 
-            if mode == MODE_AUTO:
-                return await self.hass.async_add_executor_job(self.api.set_es_mode_auto)
-            if mode == MODE_AI:
-                return await self.hass.async_add_executor_job(self.api.set_es_mode_ai)
-            if mode == MODE_MANUAL:
-                return await self.hass.async_add_executor_job(
-                    self.api.set_es_mode_manual, 0, "00:00", "23:59", 127, 100, 1
-                )
-
-            return False
+            return await self._async_send_mode_command(
+                mode=mode, power=100 if mode == MODE_MANUAL else None, source=source
+            )
 
     async def async_stop_passive_control(self) -> None:
         """Stop maintaining passive mode power."""
         async with self._passive_command_lock:
             self._clear_passive_control()
 
-    async def _async_send_passive_power(self, outcome_state: str) -> bool:
-        """Send the current passive power target and schedule its keepalive.
+    async def _async_send_mode_command(
+        self, *, mode: str, source: str, power: int | None = None
+    ) -> bool:
+        """Log and send a mode command using the API's set_result semantics.
 
-        Called both by the 180s keepalive and by poll-driven verify retries;
-        either path reschedules the same keepalive timer, so once the target
-        is confirmed the keepalive alone keeps it alive every 180s.
+        A successful request still needs separate confirmation from ES.GetMode.
+        Callers serialize commands with the passive command lock.
         """
+        command: Callable[..., bool]
+        args: tuple[int | str, ...]
+        if mode == MODE_PASSIVE and power is not None:
+            command, args = self.api.set_es_mode_passive, (power,)
+        elif mode == MODE_AUTO:
+            command, args = self.api.set_es_mode_auto, ()
+        elif mode == MODE_AI:
+            command, args = self.api.set_es_mode_ai, ()
+        elif mode == MODE_MANUAL and power is not None:
+            command, args = (
+                self.api.set_es_mode_manual,
+                (0, "00:00", "23:59", 127, power, 1),
+            )
+        else:
+            return False
+
+        context = (
+            f"device={self.entry.title} device_id={self.device_id} "
+            f"host={self.entry.data['host']} port={self.entry.data.get('port', 30000)} "
+            f"source={source} method=ES.SetMode mode={mode}"
+        )
+        if power is not None:
+            context += f" power={power}W"
+        if mode == MODE_MANUAL:
+            context += (
+                " time_num=0 start_time=00:00 end_time=23:59 week_set=127 enable=1"
+            )
+        _LOGGER.debug("Marstek command: %s", context)
+        error = "API returned failure (request failed or set_result missing/false)"
+        try:
+            success = bool(await self.hass.async_add_executor_job(command, *args))
+        except Exception as err:  # noqa: BLE001 - Keep maintenance alive on API failure.
+            success = False
+            error = f"{type(err).__name__}: {err}"
+
+        if success:
+            _LOGGER.debug("Marstek command succeeded: %s", context)
+        else:
+            next_action = (
+                f"retry in {PASSIVE_POWER_RETRY_SECONDS}s"
+                if mode == MODE_PASSIVE
+                else "passive control stopped; no automatic retry"
+            )
+            _LOGGER.warning(
+                "Marstek command failed: %s error=%s; %s", context, error, next_action
+            )
+        return success
+
+    async def _async_send_passive_power(
+        self, outcome_state: str, *, source: str
+    ) -> bool:
+        """Send the current target and replace the shared keepalive/retry timer."""
         if self._passive_power_target is None:
             return False
 
-        power = self._passive_power_target
-        success = await self.hass.async_add_executor_job(
-            self.api.set_es_mode_passive,
-            power,
+        # Also invalidate callbacks which have fired but are waiting for the lock.
+        self._cancel_passive_keepalive()
+        success = await self._async_send_mode_command(
+            mode=MODE_PASSIVE, power=self._passive_power_target, source=source
         )
-        self._schedule_passive_keepalive()
+        self._schedule_passive_keepalive(
+            delay=(
+                PASSIVE_POWER_KEEPALIVE_SECONDS
+                if success
+                else PASSIVE_POWER_RETRY_SECONDS
+            ),
+            source="keepalive" if success else "keepalive_retry",
+        )
         if success:
             self._set_passive_power_state(outcome_state)
         return success
 
-    def _schedule_passive_keepalive(self) -> None:
-        """Schedule a command-only passive power keepalive."""
+    def _schedule_passive_keepalive(self, *, delay: int, source: str) -> None:
+        """Replace the one command-only timer after either success or failure."""
         self._cancel_passive_keepalive()
         generation = self._passive_control_generation
         self._passive_keepalive_cancel = async_call_later(
             self.hass,
-            PASSIVE_POWER_KEEPALIVE_SECONDS,
+            delay,
             lambda _now: self.hass.async_create_task(
-                self._async_keepalive_passive_power(generation)
+                self._async_keepalive_passive_power(generation, source=source)
             ),
+        )
+        _LOGGER.debug(
+            "Marstek command scheduled: device=%s device_id=%s source=%s "
+            "mode=Passive power=%sW delay=%ss",
+            self.entry.title,
+            self.device_id,
+            source,
+            self._passive_power_target,
+            delay,
         )
 
     def _cancel_passive_keepalive(self) -> None:
-        """Cancel the outstanding passive power keepalive, if any."""
+        """Cancel the timer and invalidate any already-queued callback."""
+        self._passive_control_generation += 1
         if self._passive_keepalive_cancel is not None:
             self._passive_keepalive_cancel()
             self._passive_keepalive_cancel = None
@@ -291,11 +370,12 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
     def _clear_passive_control(self) -> None:
         """Discard the passive power target and invalidate queued callbacks."""
         self._passive_power_target = None
-        self._passive_control_generation += 1
         self._cancel_passive_keepalive()
         self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
 
-    async def _async_keepalive_passive_power(self, generation: int) -> None:
+    async def _async_keepalive_passive_power(
+        self, generation: int, *, source: str
+    ) -> None:
         """Resend the passive power target when its keepalive is due."""
         async with self._passive_command_lock:
             if (
@@ -305,7 +385,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 return
 
             self._passive_keepalive_cancel = None
-            await self._async_send_passive_power(PASSIVE_STATE_SENT)
+            await self._async_send_passive_power(PASSIVE_STATE_SENT, source=source)
 
     def _passive_power_is_confirmed(self, mode_data: dict) -> bool:
         """Return whether fresh mode data confirms the passive power target."""
@@ -332,11 +412,9 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 self._set_passive_power_state(PASSIVE_STATE_ACKNOWLEDGED)
                 return
 
-            _LOGGER.debug(
-                "Passive power target %s W not confirmed by reported mode data; retrying",
-                self._passive_power_target,
+            await self._async_send_passive_power(
+                PASSIVE_STATE_RETRYING, source="verification_retry"
             )
-            await self._async_send_passive_power(PASSIVE_STATE_RETRYING)
 
     async def _fetch_section(self, key: str, fetcher):
         """Fetch one section and track consecutive misses."""

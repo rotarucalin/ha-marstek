@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
@@ -343,12 +343,13 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         """Replace the one command-only timer after either success or failure."""
         self._cancel_passive_keepalive()
         generation = self._passive_control_generation
+
+        async def async_keepalive(_now: datetime) -> None:
+            """Keep HA's timer dispatch on the event loop."""
+            await self._async_keepalive_passive_power(generation, source=source)
+
         self._passive_keepalive_cancel = async_call_later(
-            self.hass,
-            delay,
-            lambda _now: self.hass.async_create_task(
-                self._async_keepalive_passive_power(generation, source=source)
-            ),
+            self.hass, delay, async_keepalive
         )
         _LOGGER.debug(
             "Marstek command scheduled: device=%s device_id=%s source=%s "

@@ -4,10 +4,14 @@ import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
 from unittest.mock import AsyncMock, call, patch
 
 import pytest
+from homeassistant.core import HassJob, HomeAssistant
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from custom_components.marstek import (
     PASSIVE_POWER_KEEPALIVE_SECONDS,
@@ -27,6 +31,7 @@ LOGGER = "custom_components.marstek"
 class ScheduledCommand:
     """A timer whose callback can also model an already queued job."""
 
+    hass: HomeAssistant
     delay: float
     action: Callable
     active: bool = True
@@ -36,7 +41,7 @@ class ScheduledCommand:
 
     def fire(self):
         self.active = False
-        return self.action(None)
+        return self.hass.async_run_hass_job(HassJob(self.action), None)
 
 
 class CommandTimers:
@@ -57,7 +62,7 @@ class CommandTimers:
     def schedule(self, hass, delay, action):
         # Fail on overlap even if a later cancellation would hide it.
         assert not self.active
-        timer = ScheduledCommand(delay, action)
+        timer = ScheduledCommand(hass, delay, action)
         self.history.append(timer)
         return timer.cancel
 
@@ -84,6 +89,34 @@ def outgoing_messages(caplog):
         for record in caplog.records
         if record.getMessage().startswith("Marstek command:")
     ]
+
+
+@pytest.mark.parametrize("success", [True, False])
+async def test_real_timer_runs_keepalive_and_retry_on_event_loop(
+    hass, marstek_entry, mock_marstek_api, freezer, success
+):
+    """HA must dispatch both timer paths without calling async APIs in a worker."""
+    marstek_entry.add_to_hass(hass)
+    coordinator = MarstekDataUpdateCoordinator(hass, mock_marstek_api, marstek_entry)
+    mock_marstek_api.set_es_mode_passive.return_value = success
+    try:
+        assert await coordinator.async_set_passive_power(240) is success
+        mock_marstek_api.set_es_mode_passive.return_value = True
+        delay = (
+            PASSIVE_POWER_KEEPALIVE_SECONDS if success else PASSIVE_POWER_RETRY_SECONDS
+        )
+        freezer.tick(timedelta(seconds=delay + 1))
+        async_fire_time_changed(hass, dt_util.utcnow())
+        await hass.async_block_till_done()
+
+        assert mock_marstek_api.set_es_mode_passive.call_args_list == [
+            call(240),
+            call(240),
+        ]
+        assert coordinator.passive_power_state == "sent"
+        assert coordinator._passive_keepalive_cancel is not None
+    finally:
+        await coordinator.async_stop_passive_control()
 
 
 async def test_new_target_and_successful_keepalive(

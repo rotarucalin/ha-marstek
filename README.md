@@ -82,9 +82,10 @@ Before adding the integration, you must enable the Open API feature:
 3. Search for **Marstek Battery System**
 4. Enter your device's IP address
 5. Enter the UDP port (default: 30000)
-6. Click **Submit**
+6. Enter your device's actual Max Passive Power in watts (default: 3000; lower this if your model's real charge/discharge limit is smaller)
+7. Click **Submit**
 
-The integration will automatically discover your device and create all available entities.
+The integration will automatically discover your device and create all available entities. Max Passive Power can be changed later from the integration's **Configure** option without re-adding the device.
 
 ## Entities
 
@@ -133,7 +134,7 @@ The integration creates the following entities:
 ### Controls
 
 - `select.marstek_operating_mode` - Select operating mode (Auto/AI/Manual/Passive)
-- `number.marstek_passive_power` - Set power in Passive mode (-3000 to 3000 W)
+- `number.marstek_passive_power` - Set power in Passive mode (±Max Passive Power, default ±3000 W; see [Configuration](#configuration))
 
 ## Operating Modes
 
@@ -164,15 +165,40 @@ Direct control of battery power. Use the `number.marstek_passive_power` entity o
 
 Only one Passive keepalive/retry timer is maintained per battery. New commands replace the pending timer and invalidate queued callbacks; retries use the current target. Selecting another operating mode, stopping Passive control, or unloading the integration cancels maintenance. No automation retry loop is needed. The Passive Power number continues to report the device's `ongrid_power`, separately from the maintained target.
 
+#### Adaptive power compensation
+
+The device treats a Passive power value as a raw command, not a guaranteed output — inverter and standby losses mean asking for 240 W of discharge typically yields somewhat less. The `power` you set is the **desired real output**, not the raw command. The integration automatically learns, per direction (charge/discharge) and per 20 W bucket of desired power, what command actually produces that output, and applies it for you:
+
+```
+power: 240 (desired discharge) -> integration learns to send 275 W -> device reports ~240 W actual
+```
+
+- Learning only happens from valid, settled samples: Passive mode active and acknowledged, the command unchanged for at least 15 seconds, several consecutive stable readings, not mid comms-retry, and not blocked by SOC or a charge/discharge limit.
+- Corrections are gradual (an exponential moving average, not a jump to the latest error) so the command converges without oscillating. Small errors (±10 W) are left alone.
+- The learned mapping persists across Home Assistant restarts and interpolates between known buckets.
+- Commands are clamped to a configurable **Max Passive Power** limit (default 3000 W — set it to your device's actual rated charge/discharge power under **Settings → Devices & Services → Marstek Battery System → Configure**, or at initial setup). If the desired output cannot be reached because the command is already pinned at that limit, the integration stops trying to increase it further and logs a WARNING once per bucket.
+- The keepalive and retry timers always resend the compensated command, never the raw desired value, so a Home Assistant restart or a dropped Passive session doesn't regress to an uncompensated command.
+
 Enable `custom_components.marstek: debug` in Home Assistant's logger configuration to trace operating-mode commands. Each outgoing `ES.SetMode` command and its result include the device name, BLE MAC, host/port, mode, power (when applicable), and source:
 
 - `new_target`: a target supplied through the Passive service or number entity.
 - `keepalive`: the normal periodic refresh.
 - `keepalive_retry`: a timer retry following a failed Passive send.
 - `verification_retry`: a resend after fresh polling data fails to confirm the target.
+- `compensation`: a resend after the learned command was adjusted to close the gap between desired and actual output.
 - `operating_mode_select`: an explicit Auto, AI, or Manual selection.
 
 Successful traffic and the next timer's source/delay are logged at DEBUG. A failed command produces one WARNING with the next action; underlying transport/protocol errors add DEBUG details. A command is logged as successful only when the API returns a truthy `set_result`. Confirmation of reported mode/power remains a separate polling step.
+
+While a Passive target is maintained, a separate DEBUG line traces the three power values and where the command came from:
+
+```
+Marstek passive power: device=Marstek Venus A device_id=AA:BB:CC:DD:EE:01 desired=240W command=275W actual=241W source=compensation
+```
+
+`source` here is one of `direct` (no calibration yet, or zero power), `calibration` (an exact learned bucket), `interpolation` (between two learned buckets), `extrapolation` (beyond the learned range, carrying the nearest bucket's offset), `compensation` (a resend just triggered by a learning step), or `saturated` (the desired output can't be reached because the command is pinned at a device limit).
+
+**Possible future improvement**: Max Passive Power is currently a single symmetric limit (±the configured value) shared by both charge and discharge. Some devices have different real charge and discharge ratings, so separate `Max Charge Power` / `Max Discharge Power` options would let the compensation clamp each direction to its own actual limit instead of the more conservative shared one.
 
 ## Services
 
@@ -206,9 +232,11 @@ Set and maintain passive mode power in a single call. Prefer this over the two-s
 service: marstek.set_operating_mode_passive
 data:
   entity_id: select.marstek_operating_mode
-  power: 800      # Power in watts (-3000 to 3000). Positive = discharge, negative = charge.
+  power: 800      # Desired real output in watts (-3000 to 3000). Positive = discharge, negative = charge.
   cd_time: 3600   # Retained for compatibility; ignored by the integration.
 ```
+
+`power` is the real output you want, not the raw device command — see [Adaptive power compensation](#adaptive-power-compensation) above.
 
 ## Automation Examples
 

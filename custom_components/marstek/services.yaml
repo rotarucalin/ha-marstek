@@ -12,7 +12,7 @@ set_operating_mode_passive:
           integration: marstek
     power:
       name: Power
-      description: Passive mode power in watts. Positive discharges, negative charges.
+      description: Desired real battery output in watts. Positive discharges, negative charges. The integration automatically compensates for inverter/standby losses so this reflects actual output, not the raw device command. Values beyond your device's configured Max Passive Power are clamped.
       required: true
       example: 800
       selector:

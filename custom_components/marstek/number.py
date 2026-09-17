@@ -27,8 +27,6 @@ class MarstekPassivePowerNumber(MarstekEntity, NumberEntity):
     """Representation of Marstek passive mode power setting."""
 
     _attr_mode = NumberMode.BOX
-    _attr_native_min_value = -3000
-    _attr_native_max_value = 3000
     _attr_native_step = 10
     _attr_native_unit_of_measurement = UnitOfPower.WATT
 
@@ -36,6 +34,16 @@ class MarstekPassivePowerNumber(MarstekEntity, NumberEntity):
         """Initialize the number entity."""
         super().__init__(coordinator, "passive_power")
         self._attr_name = "Passive Mode Power"
+
+    @property
+    def native_min_value(self) -> float:
+        """Return the configured lower bound for this device."""
+        return self.coordinator.calibration.command_min
+
+    @property
+    def native_max_value(self) -> float:
+        """Return the configured upper bound for this device."""
+        return self.coordinator.calibration.command_max
 
     @property
     def native_value(self) -> float | None:

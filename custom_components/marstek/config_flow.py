@@ -9,19 +9,32 @@ import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.const import CONF_HOST, CONF_PORT
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 
-from .const import DEFAULT_PORT, DOMAIN
+from .const import (
+    CONF_MAX_PASSIVE_POWER,
+    DEFAULT_MAX_PASSIVE_POWER,
+    DEFAULT_PORT,
+    DOMAIN,
+    MAX_PASSIVE_POWER_LIMIT,
+)
 from .identity import CONF_DEVICE_INFO, device_metadata, normalize_mac
 from .marstek_api import MarstekAPI
 
 _LOGGER = logging.getLogger(__name__)
 
+MAX_PASSIVE_POWER_SELECTOR = vol.All(
+    vol.Coerce(int), vol.Range(min=1, max=MAX_PASSIVE_POWER_LIMIT)
+)
+
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_HOST): str,
         vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
+        vol.Optional(
+            CONF_MAX_PASSIVE_POWER, default=DEFAULT_MAX_PASSIVE_POWER
+        ): MAX_PASSIVE_POWER_SELECTOR,
     }
 )
 
@@ -52,6 +65,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Marstek Battery System."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> OptionsFlowHandler:
+        """Create the options flow for adjusting settings after setup."""
+        return OptionsFlowHandler()
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -88,6 +109,32 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
         )
+
+
+class OptionsFlowHandler(config_entries.OptionsFlow):
+    """Let an existing entry's device-specific settings be adjusted later."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        current = self.config_entry.options.get(
+            CONF_MAX_PASSIVE_POWER,
+            self.config_entry.data.get(
+                CONF_MAX_PASSIVE_POWER, DEFAULT_MAX_PASSIVE_POWER
+            ),
+        )
+        schema = vol.Schema(
+            {
+                vol.Optional(
+                    CONF_MAX_PASSIVE_POWER, default=current
+                ): MAX_PASSIVE_POWER_SELECTOR,
+            }
+        )
+        return self.async_show_form(step_id="init", data_schema=schema)
 
 
 class CannotConnect(Exception):

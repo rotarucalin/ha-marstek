@@ -8,13 +8,25 @@ from unittest.mock import AsyncMock, call, patch
 
 import pytest
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.storage import Store
 
 from custom_components.marstek import (
     PASSIVE_POWER_KEEPALIVE_SECONDS,
     PASSIVE_POWER_RETRY_SECONDS,
     MarstekDataUpdateCoordinator,
 )
-from custom_components.marstek.const import DOMAIN
+from custom_components.marstek.const import (
+    CALIBRATION_STORAGE_KEY_FMT,
+    CALIBRATION_STORAGE_VERSION,
+    DOMAIN,
+    PASSIVE_COMMAND_MAX,
+    PASSIVE_DEADBAND_W,
+    PASSIVE_SETTLE_SECONDS,
+    PASSIVE_SOC_LEARN_MAX,
+    PASSIVE_SOC_LEARN_MIN,
+    PASSIVE_STABILITY_SAMPLES,
+    SOURCE_CALIBRATION,
+)
 from custom_components.marstek.number import MarstekPassivePowerNumber
 from custom_components.marstek.select import MarstekOperatingModeSelect
 from custom_components.marstek.services import async_register_services
@@ -86,6 +98,51 @@ def outgoing_messages(caplog):
     ]
 
 
+def passive_power_messages(caplog):
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Marstek passive power:")
+    ]
+
+
+class FakeClock:
+    """A settable stand-in for time.monotonic driving settle/stability windows."""
+
+    def __init__(self, start: float = 1_000.0):
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def clock():
+    fake = FakeClock()
+    with patch("custom_components.marstek.monotonic", fake):
+        yield fake
+
+
+async def _settle_and_sample(coordinator, clock, actual, count=PASSIVE_STABILITY_SAMPLES):
+    """Advance past the settle window and feed `count` stable measurements.
+
+    Mirrors one learning round: a poll cadence of stable telemetry taken after
+    the command has had time to settle.
+    """
+    clock.advance(PASSIVE_SETTLE_SECONDS + 1)
+    for _ in range(count):
+        await coordinator._async_verify_passive_power(
+            {"mode": "Passive", "ongrid_power": actual},
+            es_data={"ongrid_power": actual},
+            battery_data={"soc": 50},
+            fresh=frozenset({"es_mode", "es", "battery"}),
+        )
+        clock.advance(1)
+
+
 async def test_new_target_and_successful_keepalive(
     coordinator, command_timers, mock_marstek_api, caplog
 ):
@@ -124,7 +181,7 @@ async def test_failed_keepalives_retry_until_success(
     caplog.clear()
     await command_timers.current.fire()
     assert command_timers.current.delay == 15
-    assert coordinator._passive_power_target == 240
+    assert coordinator._passive_desired_power == 240
     assert "source=keepalive " in outgoing_messages(caplog)[0]
     assert "Marstek command succeeded:" not in caplog.text
     assert "retry in 15s" in caplog.text
@@ -133,7 +190,7 @@ async def test_failed_keepalives_retry_until_success(
     caplog.clear()
     await command_timers.current.fire()
     assert command_timers.current.delay == 15
-    assert coordinator._passive_power_target == 240
+    assert coordinator._passive_desired_power == 240
     assert "source=keepalive_retry" in outgoing_messages(caplog)[0]
     assert "Marstek command succeeded:" not in caplog.text
 
@@ -151,7 +208,7 @@ async def test_failed_initial_target_also_retries(
 ):
     mock_marstek_api.set_es_mode_passive.return_value = False
     assert not await coordinator.async_set_passive_power(-500)
-    assert coordinator._passive_power_target == -500
+    assert coordinator._passive_desired_power == -500
     assert command_timers.current.delay == 15
     assert "source=new_target" in outgoing_messages(caplog)[0]
 
@@ -198,7 +255,7 @@ async def test_select_stops_retries_even_if_mode_command_fails(
         await MarstekOperatingModeSelect(coordinator).async_select_option(mode)
         assert refresh.await_count == int(success)
     assert not command_timers.active
-    assert coordinator._passive_power_target is None
+    assert coordinator._passive_desired_power is None
     assert coordinator.passive_power_state == "unknown"
     await retry.fire()
     await coordinator._async_verify_passive_power({"mode": "Auto"})
@@ -223,7 +280,7 @@ async def test_selecting_passive_does_not_send_or_replace_target(
     with patch.object(coordinator, "async_request_refresh", new_callable=AsyncMock):
         await MarstekOperatingModeSelect(coordinator).async_select_option("Passive")
     assert command_timers.current is timer
-    assert coordinator._passive_power_target == 240
+    assert coordinator._passive_desired_power == 240
     mock_marstek_api.set_es_mode_passive.assert_not_called()
     assert not outgoing_messages(caplog)
 
@@ -241,7 +298,7 @@ async def test_verification_resend_replaces_timer(
     assert not old_timer.active
     replacement = command_timers.current
     assert replacement.delay == (180 if success else 15)
-    assert coordinator._passive_power_target == 240
+    assert coordinator._passive_desired_power == 240
     assert "source=verification_retry" in outgoing_messages(caplog)[0]
     assert coordinator.passive_power_state == ("retrying" if success else "sent")
     await old_timer.fire()
@@ -313,7 +370,7 @@ async def test_callback_queued_behind_superseding_command_is_invalidated(
     else:
         mock_marstek_api.set_es_mode_passive.assert_not_called()
         assert not command_timers.active
-        assert coordinator._passive_power_target is None
+        assert coordinator._passive_desired_power is None
 
 
 @pytest.mark.parametrize("success", [True, False])
@@ -341,7 +398,7 @@ async def test_stop_waits_for_in_flight_send_and_cancels_its_timer(
             await asyncio.gather(keepalive, stop)
     assert not command_timers.active
     assert coordinator._passive_keepalive_cancel is None
-    assert coordinator._passive_power_target is None
+    assert coordinator._passive_desired_power is None
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")
@@ -382,7 +439,7 @@ async def test_service_behavior_and_logging(
         blocking=True,
     )
     mock_marstek_api.set_es_mode_passive.assert_called_once_with(-500)
-    assert coordinator._passive_power_target == -500
+    assert coordinator._passive_desired_power == -500
     assert command_timers.current.delay == (180 if success else 15)
     assert "source=new_target" in outgoing_messages(caplog)[0]
     failures = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -396,8 +453,274 @@ async def test_number_keeps_measured_output_separate_from_target(
     coordinator.data = {"es_mode": {"mode": "Passive", "ongrid_power": 215}}
     mock_marstek_api.set_es_mode_passive.return_value = False
     await number.async_set_native_value(300)
-    assert coordinator._passive_power_target == 300
+    assert coordinator._passive_desired_power == 300
     assert number.native_value == 215
     assert "source=new_target" in outgoing_messages(caplog)[0]
     coordinator.data = {"es_mode": {"mode": "Auto", "ongrid_power": 215}}
     assert number.native_value is None
+
+
+# --- Adaptive passive-power compensation -----------------------------------
+
+
+async def test_no_calibration_sends_desired_directly(
+    coordinator, command_timers, mock_marstek_api, caplog
+):
+    """With nothing learned yet, the command sent equals the desired output."""
+    assert await coordinator.async_set_passive_power(240)
+    assert coordinator.desired_power == 240
+    assert coordinator.command_power == 240
+    mock_marstek_api.set_es_mode_passive.assert_called_once_with(240)
+    messages = passive_power_messages(caplog)
+    assert len(messages) == 1
+    assert "desired=240W command=240W" in messages[0]
+    assert "source=direct" in messages[0]
+
+
+async def test_convergence_toward_desired_output(
+    coordinator, command_timers, mock_marstek_api, clock
+):
+    """A constant loss is learned in one step and the deadband then holds it."""
+    loss = 100
+
+    def actual_for(command):
+        return command - loss
+
+    assert await coordinator.async_set_passive_power(240)
+    assert coordinator.command_power == 240
+
+    # Two unsettled/insufficient samples merely retry the unchanged command...
+    await _settle_and_sample(coordinator, clock, actual_for(240), count=2)
+    assert coordinator.command_power == 240
+    # ...the third stable sample is enough to learn and resend.
+    for _ in range(1):
+        await coordinator._async_verify_passive_power(
+            {"mode": "Passive", "ongrid_power": actual_for(240)},
+            es_data={"ongrid_power": actual_for(240)},
+            battery_data={"soc": 50},
+            fresh=frozenset({"es_mode", "es", "battery"}),
+        )
+        clock.advance(1)
+
+    learned_command = coordinator.command_power
+    assert learned_command != 240
+    mock_marstek_api.set_es_mode_passive.assert_called_with(learned_command)
+
+    # A second settled round at the learned command should now be within the
+    # deadband and require no further correction.
+    await _settle_and_sample(coordinator, clock, actual_for(learned_command))
+    assert coordinator.command_power == learned_command
+    assert abs(actual_for(learned_command) - 240) <= PASSIVE_DEADBAND_W
+    assert coordinator.passive_power_state == "acknowledged"
+
+
+async def test_deadband_leaves_a_known_command_unchanged(
+    coordinator, command_timers, mock_marstek_api, clock
+):
+    """A small error around a learned bucket must not perturb it."""
+    coordinator.calibration.observe(240, 240, 205)  # seeds bucket 240 -> 275
+    assert await coordinator.async_set_passive_power(240)
+    assert coordinator.command_power == 275
+    timer = command_timers.current
+    mock_marstek_api.set_es_mode_passive.reset_mock()
+
+    # An 8W error is inside the deadband.
+    await _settle_and_sample(coordinator, clock, actual=240 - 8)
+
+    assert coordinator.command_power == 275
+    assert coordinator.calibration.command_for(240) == (275, SOURCE_CALIBRATION)
+    assert command_timers.current is timer
+    mock_marstek_api.set_es_mode_passive.assert_not_called()
+
+
+async def test_keepalive_resends_learned_command_not_desired(
+    coordinator, command_timers, mock_marstek_api
+):
+    """The maintained keepalive must resend the compensated value, not desired."""
+    coordinator.calibration.observe(240, 240, 205)  # seeds bucket 240 -> 275
+    assert await coordinator.async_set_passive_power(240)
+    assert coordinator.desired_power == 240
+    assert coordinator.command_power == 275
+    mock_marstek_api.set_es_mode_passive.assert_called_once_with(275)
+
+    mock_marstek_api.set_es_mode_passive.reset_mock()
+    await command_timers.current.fire()
+    mock_marstek_api.set_es_mode_passive.assert_called_once_with(275)
+
+
+async def test_new_desired_power_recomputes_command(
+    coordinator, command_timers, mock_marstek_api
+):
+    """Changing the desired output derives a fresh command, not the old one."""
+    coordinator.calibration.observe(240, 240, 205)  # seeds bucket 240 -> 275
+    assert await coordinator.async_set_passive_power(240)
+    assert coordinator.command_power == 275
+
+    assert await coordinator.async_set_passive_power(300)  # no calibration for 300
+    assert coordinator.command_power == 300
+    mock_marstek_api.set_es_mode_passive.assert_called_with(300)
+
+
+async def test_stale_keepalive_cannot_override_newer_compensation_command(
+    coordinator, command_timers, mock_marstek_api, clock
+):
+    """A retry queued before a learning step must not resend the old command."""
+    assert await coordinator.async_set_passive_power(240)
+
+    # Two priming polls accumulate samples but are not yet enough to learn;
+    # each also resends the unconfirmed, unchanged command via a fresh timer.
+    await _settle_and_sample(coordinator, clock, actual=100, count=PASSIVE_STABILITY_SAMPLES - 1)
+    stale_timer = command_timers.current
+    mock_marstek_api.set_es_mode_passive.reset_mock()
+    mock_marstek_api.set_es_mode_passive.return_value = True
+
+    await coordinator._passive_command_lock.acquire()
+    try:
+        compensating = asyncio.create_task(
+            coordinator._async_verify_passive_power(
+                {"mode": "Passive", "ongrid_power": 100},
+                es_data={"ongrid_power": 100},
+                battery_data={"soc": 50},
+                fresh=frozenset({"es_mode", "es", "battery"}),
+            )
+        )
+        await asyncio.sleep(0)
+        queued_stale = stale_timer.fire()
+        await asyncio.sleep(0)
+    finally:
+        coordinator._passive_command_lock.release()
+
+    await asyncio.gather(compensating, queued_stale)
+
+    learned_command = coordinator.command_power
+    assert learned_command != 240
+    mock_marstek_api.set_es_mode_passive.assert_called_once_with(learned_command)
+    assert command_timers.current.delay == 180
+
+
+async def test_saturation_stops_growing_and_warns_once(
+    coordinator, command_timers, mock_marstek_api, clock, caplog
+):
+    """A command pinned at the device limit stops growing and warns once."""
+    assert await coordinator.async_set_passive_power(2980)
+
+    await _settle_and_sample(coordinator, clock, actual=2000)
+    assert coordinator.command_power == PASSIVE_COMMAND_MAX
+
+    def saturation_warnings():
+        return [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+            and "saturated" in record.getMessage()
+        ]
+
+    caplog.clear()
+    await _settle_and_sample(coordinator, clock, actual=2000)
+    assert coordinator.command_power == PASSIVE_COMMAND_MAX
+    assert len(saturation_warnings()) == 1
+
+    caplog.clear()
+    await _settle_and_sample(coordinator, clock, actual=2000)
+    assert coordinator.command_power == PASSIVE_COMMAND_MAX
+    assert not saturation_warnings()
+
+
+@pytest.mark.parametrize(
+    "gate",
+    [
+        "mode_not_passive",
+        "not_settled",
+        "too_few_samples",
+        "unstable_samples",
+        "failed_send",
+        "stale_es_mode",
+        "stale_es",
+        "soc_blocked_discharge",
+        "soc_blocked_charge",
+        "below_min_learn_power",
+    ],
+)
+async def test_validity_gate_blocks_learning(
+    coordinator, command_timers, mock_marstek_api, clock, gate
+):
+    """Each blocker leaves the calibration map untouched."""
+    desired = 240
+    battery = {"soc": 50}
+    fresh = frozenset({"es_mode", "es", "battery"})
+    mode = "Passive"
+    actual_values = [205, 205, 205]
+    samples_to_send = PASSIVE_STABILITY_SAMPLES
+
+    if gate == "below_min_learn_power":
+        desired = 10
+        actual_values = [0, 0, 0]
+    elif gate == "soc_blocked_discharge":
+        battery = {"soc": PASSIVE_SOC_LEARN_MIN}
+    elif gate == "soc_blocked_charge":
+        desired = -240
+        battery = {"soc": PASSIVE_SOC_LEARN_MAX}
+        actual_values = [-205, -205, -205]
+    elif gate == "unstable_samples":
+        actual_values = [180, 230, 180]
+    elif gate == "too_few_samples":
+        samples_to_send = PASSIVE_STABILITY_SAMPLES - 1
+
+    assert await coordinator.async_set_passive_power(desired)
+
+    if gate == "failed_send":
+        mock_marstek_api.set_es_mode_passive.return_value = False
+        assert not await coordinator.async_set_passive_power(desired)
+
+    if gate != "not_settled":
+        clock.advance(PASSIVE_SETTLE_SECONDS + 1)
+
+    call_fresh = fresh
+    if gate == "stale_es_mode":
+        call_fresh = frozenset({"es", "battery"})
+    elif gate == "stale_es":
+        call_fresh = frozenset({"es_mode", "battery"})
+
+    for actual in actual_values[:samples_to_send]:
+        mode_data = {
+            "mode": "Auto" if gate == "mode_not_passive" else mode,
+            "ongrid_power": actual,
+        }
+        await coordinator._async_verify_passive_power(
+            mode_data,
+            es_data={"ongrid_power": actual},
+            battery_data=battery,
+            fresh=call_fresh,
+        )
+        clock.advance(1)
+
+    assert coordinator.calibration.is_empty
+
+
+async def test_calibration_persists_across_restart(hass, marstek_entry, mock_marstek_api):
+    """A learned mapping survives an unload/reload cycle via the Store."""
+    marstek_entry.add_to_hass(hass)
+    key = CALIBRATION_STORAGE_KEY_FMT.format(entry_id=marstek_entry.entry_id)
+
+    store = Store(hass, CALIBRATION_STORAGE_VERSION, key)
+    coordinator = MarstekDataUpdateCoordinator(
+        hass, mock_marstek_api, marstek_entry, store=store, calibration_data=None
+    )
+    coordinator.calibration.observe(240, 240, 205)  # learns 275
+    await coordinator.async_save_calibration()
+    await coordinator.async_stop_passive_control()
+
+    reloaded_store = Store(hass, CALIBRATION_STORAGE_VERSION, key)
+    restored_data = await reloaded_store.async_load()
+    new_coordinator = MarstekDataUpdateCoordinator(
+        hass,
+        mock_marstek_api,
+        marstek_entry,
+        store=reloaded_store,
+        calibration_data=restored_data,
+    )
+    assert new_coordinator.calibration.command_for(240) == (275, SOURCE_CALIBRATION)
+
+    assert await new_coordinator.async_set_passive_power(240)
+    mock_marstek_api.set_es_mode_passive.assert_called_once_with(275)
+    await new_coordinator.async_stop_passive_control()

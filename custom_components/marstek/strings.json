@@ -6,7 +6,11 @@
         "description": "Enter the connection details for your Marstek device.",
         "data": {
           "host": "IP Address",
-          "port": "UDP Port"
+          "port": "UDP Port",
+          "max_passive_power": "Max Passive Power (W)"
+        },
+        "data_description": {
+          "max_passive_power": "The highest charge/discharge power your device actually supports. Passive-mode commands are clamped to this range."
         }
       }
     },
@@ -17,6 +21,19 @@
     },
     "abort": {
       "already_configured": "This device is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Marstek Battery System Options",
+        "data": {
+          "max_passive_power": "Max Passive Power (W)"
+        },
+        "data_description": {
+          "max_passive_power": "The highest charge/discharge power your device actually supports. Passive-mode commands are clamped to this range."
+        }
+      }
     }
   }
 }

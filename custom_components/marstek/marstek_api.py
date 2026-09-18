@@ -3,10 +3,15 @@
 import json
 import logging
 import socket
+from contextlib import contextmanager
+from threading import Lock
+from time import monotonic, sleep
 
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 5.0
+# Conservative workaround for firmware sensitive to closely spaced requests.
+REQUEST_GAP_SECONDS = 2.5
 
 
 class MarstekAPI:
@@ -18,6 +23,37 @@ class MarstekAPI:
         self.port = port
         self.timeout = timeout
         self._request_id = 0
+        self._request_lock = Lock()
+        self._next_request_at = 0.0
+
+    @contextmanager
+    def _request_slot(self, method: str):
+        """Serialize device I/O and let the firmware settle between requests.
+
+        API methods run in Home Assistant's executor, so waiting here does not
+        block its event loop. Polls and control commands share the same gate.
+        """
+        with self._request_lock:
+            delay = self._next_request_at - monotonic()
+            if delay > 0:
+                sleep(delay)
+            try:
+                _LOGGER.debug(
+                    "Marstek transport started: host=%s port=%s method=%s",
+                    self.host,
+                    self.port,
+                    method,
+                )
+                yield
+            finally:
+                _LOGGER.debug(
+                    "Marstek transport completed: host=%s port=%s method=%s",
+                    self.host,
+                    self.port,
+                    method,
+                )
+                # A timeout or rejected request also needs a quiet interval.
+                self._next_request_at = monotonic() + REQUEST_GAP_SECONDS
 
     def _get_next_id(self) -> int:
         """Get next request ID."""
@@ -37,6 +73,11 @@ class MarstekAPI:
 
     def _send_request(self, method: str, params: dict | None = None) -> dict | None:
         """Send a UDP JSON-RPC request."""
+        with self._request_slot(method):
+            return self._send_request_locked(method, params)
+
+    def _send_request_locked(self, method: str, params: dict | None) -> dict | None:
+        """Exchange one request while holding the shared device I/O gate."""
         if params is None:
             params = {"id": 0}
 
@@ -78,6 +119,11 @@ class MarstekAPI:
         self, broadcast_address: str = "255.255.255.255"
     ) -> list[dict]:
         """Discover Marstek devices on the network."""
+        with self._request_slot("Marstek.GetDevice (discovery)"):
+            return self._discover_devices_locked(broadcast_address)
+
+    def _discover_devices_locked(self, broadcast_address: str) -> list[dict]:
+        """Collect discovery replies while holding the device I/O gate."""
         request = {
             "id": self._get_next_id(),
             "method": "Marstek.GetDevice",

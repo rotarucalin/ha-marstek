@@ -64,6 +64,7 @@ PLATFORMS: list[Platform] = [
 ]
 
 SCAN_INTERVAL = timedelta(seconds=30)
+OPTIONAL_SECTIONS = frozenset({"ble", "pv"})
 PASSIVE_POWER_KEEPALIVE_SECONDS = 180
 PASSIVE_POWER_RETRY_SECONDS = 15
 PASSIVE_POWER_TOLERANCE = 0.20
@@ -170,6 +171,9 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                         self.device_info.setdefault("ver", device.sw_version)
         self._last_good_data: dict = {}
         self._missing_cycles: dict[str, int] = {}
+        # An absent PV input or disabled Bluetooth can silently time out.
+        # Probe again when a fresh coordinator is created on startup/reload.
+        self._disabled_optional_sections: set[str] = set()
         # The requested real output, the value actually sent, and the samples
         # measured since that value last changed.
         self._passive_desired_power: int | None = None
@@ -719,6 +723,9 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def _fetch_section(self, key: str, fetcher):
         """Fetch one section and track consecutive misses."""
+        if key in self._disabled_optional_sections:
+            return None
+
         result = await self.hass.async_add_executor_job(fetcher)
 
         if result is not None:
@@ -727,13 +734,24 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             return result
 
         self._missing_cycles[key] = self._missing_cycles.get(key, 0) + 1
+        if key in OPTIONAL_SECTIONS:
+            self._disabled_optional_sections.add(key)
+            self._last_good_data.pop(key, None)
+            _LOGGER.info(
+                "Marstek optional section %s failed; skipping it until "
+                "integration reload or Home Assistant restart: device=%s",
+                key,
+                self.entry.title,
+            )
+            return None
+
         _LOGGER.debug(
             "Marstek section %s unavailable this cycle (miss %s)",
             key,
             self._missing_cycles[key],
         )
 
-        # Keep the last good value for up to 6 missed cycles (3 minutes) before giving up and returning None
+        # Keep essential data for six missed cycles; pacing/timeouts extend each cycle.
         if self._missing_cycles[key] <= 6 and key in self._last_good_data:
             _LOGGER.debug("Using cached Marstek section %s", key)
             return self._last_good_data[key]

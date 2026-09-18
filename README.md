@@ -312,6 +312,50 @@ You can add the Marstek sensors to Home Assistant's Energy Dashboard:
 
 ### Connection Timeout
 
+Closely spaced or overlapping requests may contribute to firmware/API timeouts
+even when Wi-Fi reception is good. As a workaround, the integration serializes
+polling and control requests through one gate per device client and leaves a
+2.5-second quiet gap after each request completes,
+including timeouts and API errors. This also prevents keepalive commands from
+overlapping status queries. The 2.5-second interval is informed by
+[another integration's hardware experience](https://github.com/arvdrpoo/ha-marstek-venus/blob/main/CHANGELOG.md#050---2026-07-15);
+it still needs verification on this device and firmware. Increasing the socket
+timeout alone does not solve requests that the firmware has already dropped.
+
+PV and Bluetooth are optional. If `PV.GetStatus` or `BLE.GetStatus` fails, the
+integration flags that section and stops querying it for the remainder of the
+session. Its sensors become unavailable; stale readings are not kept for a
+disabled section. Reload the Marstek integration or restart Home Assistant to
+probe these endpoints again after connecting PV or enabling Bluetooth. A
+transient failure also sets this flag, so reload if an installed component was
+temporarily unresponsive. A successful response, including zero PV power or an
+empty dictionary result, keeps the section in normal polling. Wi-Fi, battery,
+energy-system, operating-mode, and energy-meter queries continue retrying normally.
+
+Passive command failures retain their existing 15-second retry and successful
+commands their 180-second keepalive; the transport adds no immediate retries.
+These timers run after the command completes; a command can also wait for an
+in-flight request and the quiet interval. Poll cycles take longer with pacing.
+The gap reduces request pressure but cannot guarantee that all device-side
+failures disappear. The gate is per client and cannot coordinate traffic from
+other integrations, apps, or API clients.
+
+After replacing the integration's Python files, restart Home Assistant to load
+the updated code. For subsequent optional-endpoint reprobes, an integration
+reload is sufficient. With debug logging enabled for `custom_components.marstek`,
+check fresh logs for:
+
+- At most one failed `BLE.GetStatus` and one failed `PV.GetStatus` request per
+  coordinator lifetime, each followed by the section's skip message.
+- Continued essential polling and recovery after temporary timeouts.
+- `Marstek transport started` / `completed` pairs that do not overlap for the
+  same client, with at least 2.5 seconds from completion to the next start.
+  Use these transport timestamps for spacing; command-intent messages can be
+  logged before a command waits for its transport slot.
+- The frequency of `-32700` parse errors and essential endpoint timeouts,
+  compared with the previous logs. Persistent failures need further device
+  investigation; this workaround does not establish their cause.
+
 1. Check firewall settings (UDP port must be open)
 2. Ensure static IP is set for the device
 3. Restart the Marstek device
@@ -324,7 +368,7 @@ You can add the Marstek sensors to Home Assistant's Energy Dashboard:
 3. Reload the integration from the UI
 4. Check if Open API is still enabled
 
-**Note on data caching**: The integration caches the last known good values for each data section for up to 3 minutes (6 polling cycles at 30s intervals). If the device is briefly unreachable, entities will continue to show their last known values rather than becoming unavailable. After 3 minutes without a successful response, entities will report as unavailable.
+**Note on data caching**: Essential data sections retain their last known good values for six missed polling cycles, then become unavailable until a successful response. The time this spans depends on request latency and pacing as well as the 30-second polling interval. Failed optional PV/Bluetooth sections immediately become unavailable and remain disabled until integration reload or Home Assistant restart.
 
 ### Enable Debug Logging
 

@@ -100,7 +100,8 @@ async def test_real_api_failure_schedules_retry_with_one_warning(
             connection.recvfrom.return_value = (failure, ("192.0.2.1", 30000))
         assert not await coordinator.async_set_passive_power(240)
         assert later.call_args.args[1] == 15
-        assert coordinator._passive_power_target == 240
+        assert coordinator.desired_power == 240
+        assert coordinator.command_power == 240
         assert "Marstek command succeeded:" not in caplog.text
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warnings) == 1

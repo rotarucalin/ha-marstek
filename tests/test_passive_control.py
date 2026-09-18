@@ -589,9 +589,11 @@ async def test_new_desired_power_recomputes_command(
     assert await coordinator.async_set_passive_power(240)
     assert coordinator.command_power == 275
 
-    assert await coordinator.async_set_passive_power(300)  # no calibration for 300
-    assert coordinator.command_power == 300
-    mock_marstek_api.set_es_mode_passive.assert_called_with(300)
+    # The new target carries the nearest learned offset (+35 W).
+    assert await coordinator.async_set_passive_power(300)
+    assert coordinator.desired_power == 300
+    assert coordinator.command_power == 335
+    mock_marstek_api.set_es_mode_passive.assert_called_with(335)
 
 
 async def test_stale_keepalive_cannot_override_newer_compensation_command(

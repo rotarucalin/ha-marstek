@@ -163,7 +163,7 @@ Direct control of battery power. Use the `number.marstek_passive_power` entity o
 
 **Note**: Selecting "Passive" via the operating mode select entity does **not** automatically send a power command. You must explicitly set the desired power using the number entity or the `set_operating_mode_passive` service. This prevents unintended intermediate power values when switching modes.
 
-Only one Passive keepalive/retry timer is maintained per battery. New commands replace the pending timer and invalidate queued callbacks; retries use the current target. Selecting another operating mode, stopping Passive control, or unloading the integration cancels maintenance. No automation retry loop is needed. The Passive Power number continues to report the device's `ongrid_power`, separately from the maintained target.
+Only one Passive keepalive/retry timer is maintained per battery. New commands replace the pending timer and invalidate queued callbacks; retries use the current target. Selecting another operating mode, stopping Passive control, or unloading the integration cancels maintenance. No automation retry loop is needed. The Passive Power number reports the maintained target, while the separate Grid Power sensor reports the device's measured `ongrid_power`.
 
 #### Adaptive power compensation
 

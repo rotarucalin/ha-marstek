@@ -47,13 +47,16 @@ class MarstekPassivePowerNumber(MarstekEntity, NumberEntity):
 
     @property
     def native_value(self) -> float | None:
-        """Return the current value."""
+        """Return the maintained passive power target."""
         if "es_mode" not in self.coordinator.data:
             return None
 
         mode_data = self.coordinator.data["es_mode"]
         if mode_data is None or mode_data.get("mode") != MODE_PASSIVE:
             return None
+
+        if self.coordinator.desired_power is not None:
+            return self.coordinator.desired_power
 
         return mode_data.get("ongrid_power")
 

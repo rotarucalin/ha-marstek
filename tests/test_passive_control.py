@@ -479,7 +479,7 @@ async def test_service_behavior_and_logging(
     assert len(failures) == int(not success)
 
 
-async def test_number_keeps_measured_output_separate_from_target(
+async def test_number_keeps_requested_target_separate_from_measured_output(
     coordinator, mock_marstek_api, caplog
 ):
     number = MarstekPassivePowerNumber(coordinator)
@@ -487,7 +487,7 @@ async def test_number_keeps_measured_output_separate_from_target(
     mock_marstek_api.set_es_mode_passive.return_value = False
     await number.async_set_native_value(300)
     assert coordinator._passive_desired_power == 300
-    assert number.native_value == 215
+    assert number.native_value == 300
     assert "source=new_target" in outgoing_messages(caplog)[0]
     coordinator.data = {"es_mode": {"mode": "Auto", "ongrid_power": 215}}
     assert number.native_value is None

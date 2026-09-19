@@ -27,7 +27,7 @@ class MarstekAPI:
         self._next_request_at = 0.0
 
     @contextmanager
-    def _request_slot(self, method: str):
+    def _request_slot(self):
         """Serialize device I/O and let the firmware settle between requests.
 
         API methods run in Home Assistant's executor, so waiting here does not
@@ -38,20 +38,8 @@ class MarstekAPI:
             if delay > 0:
                 sleep(delay)
             try:
-                _LOGGER.debug(
-                    "Marstek transport started: host=%s port=%s method=%s",
-                    self.host,
-                    self.port,
-                    method,
-                )
                 yield
             finally:
-                _LOGGER.debug(
-                    "Marstek transport completed: host=%s port=%s method=%s",
-                    self.host,
-                    self.port,
-                    method,
-                )
                 # A timeout or rejected request also needs a quiet interval.
                 self._next_request_at = monotonic() + REQUEST_GAP_SECONDS
 
@@ -73,7 +61,7 @@ class MarstekAPI:
 
     def _send_request(self, method: str, params: dict | None = None) -> dict | None:
         """Send a UDP JSON-RPC request."""
-        with self._request_slot(method):
+        with self._request_slot():
             return self._send_request_locked(method, params)
 
     def _send_request_locked(self, method: str, params: dict | None) -> dict | None:
@@ -119,7 +107,7 @@ class MarstekAPI:
         self, broadcast_address: str = "255.255.255.255"
     ) -> list[dict]:
         """Discover Marstek devices on the network."""
-        with self._request_slot("Marstek.GetDevice (discovery)"):
+        with self._request_slot():
             return self._discover_devices_locked(broadcast_address)
 
     def _discover_devices_locked(self, broadcast_address: str) -> list[dict]:

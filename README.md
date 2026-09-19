@@ -348,13 +348,14 @@ check fresh logs for:
 - At most one failed `BLE.GetStatus` and one failed `PV.GetStatus` request per
   coordinator lifetime, each followed by the section's skip message.
 - Continued essential polling and recovery after temporary timeouts.
-- `Marstek transport started` / `completed` pairs that do not overlap for the
-  same client, with at least 2.5 seconds from completion to the next start.
-  Use these transport timestamps for spacing; command-intent messages can be
-  logged before a command waits for its transport slot.
 - The frequency of `-32700` parse errors and essential endpoint timeouts,
   compared with the previous logs. Persistent failures need further device
   investigation; this workaround does not establish their cause.
+
+Routine transport start/completion messages are omitted from DEBUG output.
+Request failures, command results, retries, calibration changes, and polling
+summaries are still logged. Request serialization and the 2.5-second gap apply
+regardless of logging verbosity.
 
 1. Check firewall settings (UDP port must be open)
 2. Ensure static IP is set for the device

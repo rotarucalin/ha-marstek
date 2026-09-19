@@ -170,3 +170,117 @@ async def test_reload_reprobes_sections_and_restores_entity_availability(
     assert hass.states.get(ble_id).state == "off"
     for method in OPTIONAL.values():
         assert getattr(mock_marstek_api, method).call_count == 3
+
+
+@pytest.mark.parametrize("previously_connected", [False, True])
+@pytest.mark.parametrize("disconnected", [0, False])
+async def test_ct_disconnection_stops_meter_queries(
+    coordinator, mock_marstek_api, caplog, previously_connected, disconnected
+):
+    """The first disconnected reading discards meter data and stops only EM."""
+    caplog.set_level(logging.INFO, logger="custom_components.marstek")
+    fetcher = mock_marstek_api.get_em_status
+    connected = {"ct_state": 1, "total_power": 90, "a_power": 10}
+    if previously_connected:
+        fetcher.return_value = connected
+        assert (await coordinator._async_update_data())["em"] == connected
+        # A transient timeout can precede disconnection without disabling EM.
+        fetcher.return_value = None
+        assert (await coordinator._async_update_data())["em"] == connected
+
+    preceding_calls = fetcher.call_count
+    fetcher.return_value = {**connected, "ct_state": disconnected}
+    for cycle in range(3):
+        data = await coordinator._async_update_data()
+        assert "em" not in data
+        assert "em" not in coordinator._last_good_data
+        assert "em" not in coordinator._missing_cycles
+        assert coordinator._disabled_optional_sections == {"em"}
+        assert fetcher.call_count == preceding_calls + 1
+        # A reconnected meter is not probed until reload, even if now healthy.
+        fetcher.return_value = connected
+        for key, method in {**ESSENTIAL, **OPTIONAL}.items():
+            if key != "em":
+                assert key in data
+                assert (
+                    getattr(mock_marstek_api, method).call_count
+                    == preceding_calls + cycle + 1
+                )
+    assert caplog.text.count("energy meter reports CT disconnected") == 1
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        {},
+        {"ct_state": None},
+        {"ct_state": 1},
+        {"ct_state": True},
+        {"ct_state": -1},
+        {"ct_state": "0"},
+    ],
+)
+async def test_meter_requires_explicit_disconnected_state_to_stop(
+    coordinator, mock_marstek_api, response
+):
+    """Timeouts, connected readings and unknown state values keep EM polling."""
+    mock_marstek_api.get_em_status.return_value = response
+    for _ in range(3):
+        data = await coordinator._async_update_data()
+        assert not coordinator._disabled_optional_sections
+        if response is not None:
+            assert data["em"] == response
+    assert mock_marstek_api.get_em_status.call_count == 3
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_reload_reprobes_disconnected_meter_and_restores_entities(
+    hass, marstek_entry, mock_marstek_api
+):
+    """CT and all meter power entities become unavailable, then recover on reload."""
+    marstek_entry.add_to_hass(hass)
+    connected = {
+        "ct_state": 1,
+        "total_power": 90,
+        "a_power": 10,
+        "b_power": 30,
+        "c_power": 50,
+    }
+    mock_marstek_api.get_em_status.return_value = connected
+    assert await hass.config_entries.async_setup(marstek_entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator = hass.data[DOMAIN][marstek_entry.entry_id]
+    registry = er.async_get(hass)
+    states = {}
+    for platform, key, expected in (
+        ("binary_sensor", "ct_connected", "on"),
+        ("sensor", "em_total_power", "90"),
+        ("sensor", "em_phase_a_power", "10"),
+        ("sensor", "em_phase_b_power", "30"),
+        ("sensor", "em_phase_c_power", "50"),
+    ):
+        entity_id = registry.async_get_entity_id(
+            platform, DOMAIN, f"{marstek_entry.unique_id}_{key}"
+        )
+        states[entity_id] = expected
+        assert hass.states.get(entity_id).state == expected
+
+    mock_marstek_api.get_em_status.return_value = {**connected, "ct_state": 0}
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    for entity_id in states:
+        assert hass.states.get(entity_id).state == "unavailable"
+
+    mock_marstek_api.get_em_status.return_value = connected
+    await coordinator.async_refresh()
+    assert mock_marstek_api.get_em_status.call_count == 2
+
+    assert await hass.config_entries.async_reload(marstek_entry.entry_id)
+    await hass.async_block_till_done()
+    replacement = hass.data[DOMAIN][marstek_entry.entry_id]
+    assert replacement is not coordinator
+    assert not replacement._disabled_optional_sections
+    assert mock_marstek_api.get_em_status.call_count == 3
+    for entity_id, expected in states.items():
+        assert hass.states.get(entity_id).state == expected

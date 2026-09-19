@@ -330,7 +330,15 @@ probe these endpoints again after connecting PV or enabling Bluetooth. A
 transient failure also sets this flag, so reload if an installed component was
 temporarily unresponsive. A successful response, including zero PV power or an
 empty dictionary result, keeps the section in normal polling. Wi-Fi, battery,
-energy-system, operating-mode, and energy-meter queries continue retrying normally.
+energy-system, and operating-mode queries continue retrying normally.
+
+Energy-meter polling (`EM.GetStatus`) also stops for the session after its first
+response explicitly reporting `ct_state: 0` (CT disconnected). CT Connected,
+Total Meter Power, and Phase A/B/C Power become unavailable immediately, and
+cached meter readings are discarded. Reload the integration or restart Home
+Assistant to probe the meter again after reconnecting the CT. Meter timeouts,
+API errors, and responses without `ct_state` continue normal retrying; only an
+explicit disconnected state disables this endpoint.
 
 Passive command failures retain their existing 15-second retry and successful
 commands their 180-second keepalive; the transport adds no immediate retries.
@@ -347,6 +355,8 @@ check fresh logs for:
 
 - At most one failed `BLE.GetStatus` and one failed `PV.GetStatus` request per
   coordinator lifetime, each followed by the section's skip message.
+- An energy-meter skip message after the CT reports disconnected, followed by
+  no further `EM.GetStatus` queries until reload or restart.
 - Continued essential polling and recovery after temporary timeouts.
 - The frequency of `-32700` parse errors and essential endpoint timeouts,
   compared with the previous logs. Persistent failures need further device
@@ -369,7 +379,7 @@ regardless of logging verbosity.
 3. Reload the integration from the UI
 4. Check if Open API is still enabled
 
-**Note on data caching**: Essential data sections retain their last known good values for six missed polling cycles, then become unavailable until a successful response. The time this spans depends on request latency and pacing as well as the 30-second polling interval. Failed optional PV/Bluetooth sections immediately become unavailable and remain disabled until integration reload or Home Assistant restart.
+**Note on data caching**: Essential data sections retain their last known good values for six missed polling cycles, then become unavailable until a successful response. The time this spans depends on request latency and pacing as well as the 30-second polling interval. Failed optional PV/Bluetooth sections and an explicitly disconnected energy meter immediately become unavailable and remain disabled until integration reload or Home Assistant restart.
 
 ### Enable Debug Logging
 

@@ -64,6 +64,7 @@ PLATFORMS: list[Platform] = [
 ]
 
 SCAN_INTERVAL = timedelta(seconds=30)
+# EM is disabled only on an explicit CT disconnection, not on request failure.
 OPTIONAL_SECTIONS = frozenset({"ble", "pv"})
 PASSIVE_POWER_KEEPALIVE_SECONDS = 180
 PASSIVE_POWER_RETRY_SECONDS = 15
@@ -171,7 +172,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                         self.device_info.setdefault("ver", device.sw_version)
         self._last_good_data: dict = {}
         self._missing_cycles: dict[str, int] = {}
-        # An absent PV input or disabled Bluetooth can silently time out.
+        # Stop probing failed PV/Bluetooth or an explicitly disconnected CT.
         # Probe again when a fresh coordinator is created on startup/reload.
         self._disabled_optional_sections: set[str] = set()
         # The requested real output, the value actually sent, and the samples
@@ -727,6 +728,17 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             return None
 
         result = await self.hass.async_add_executor_job(fetcher)
+
+        if key == "em" and isinstance(result, dict) and result.get("ct_state") == 0:
+            self._disabled_optional_sections.add(key)
+            self._last_good_data.pop(key, None)
+            self._missing_cycles.pop(key, None)
+            _LOGGER.info(
+                "Marstek energy meter reports CT disconnected; skipping it until "
+                "integration reload or Home Assistant restart: device=%s",
+                self.entry.title,
+            )
+            return None
 
         if result is not None:
             self._missing_cycles[key] = 0

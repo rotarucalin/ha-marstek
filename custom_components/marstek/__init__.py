@@ -64,6 +64,7 @@ PLATFORMS: list[Platform] = [
 ]
 
 SCAN_INTERVAL = timedelta(seconds=30)
+WIFI_POLL_INTERVAL_SECONDS = 300
 # EM is disabled only on an explicit CT disconnection, not on request failure.
 OPTIONAL_SECTIONS = frozenset({"ble", "pv"})
 PASSIVE_POWER_KEEPALIVE_SECONDS = 180
@@ -172,6 +173,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                         self.device_info.setdefault("ver", device.sw_version)
         self._last_good_data: dict = {}
         self._missing_cycles: dict[str, int] = {}
+        self._next_wifi_poll_at = 0.0
         # Stop probing failed PV/Bluetooth or an explicitly disconnected CT.
         # Probe again when a fresh coordinator is created on startup/reload.
         self._disabled_optional_sections: set[str] = set()
@@ -411,7 +413,8 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             context += (
                 " time_num=0 start_time=00:00 end_time=23:59 week_set=127 enable=1"
             )
-        _LOGGER.debug("Marstek command: %s", context)
+        if source != "keepalive":
+            _LOGGER.debug("Marstek command: %s", context)
         error = "API returned failure (request failed or set_result missing/false)"
         try:
             success = bool(await self.hass.async_add_executor_job(command, *args))
@@ -420,7 +423,8 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             error = f"{type(err).__name__}: {err}"
 
         if success:
-            _LOGGER.debug("Marstek command succeeded: %s", context)
+            if source != "keepalive":
+                _LOGGER.debug("Marstek command succeeded: %s", context)
         else:
             next_action = (
                 f"retry in {PASSIVE_POWER_RETRY_SECONDS}s"
@@ -471,15 +475,6 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
 
         self._passive_keepalive_cancel = async_call_later(
             self.hass, delay, async_keepalive
-        )
-        _LOGGER.debug(
-            "Marstek command scheduled: device=%s device_id=%s source=%s "
-            "mode=Passive power=%sW delay=%ss",
-            self.entry.title,
-            self.device_id,
-            source,
-            self._passive_command_power,
-            delay,
         )
 
     def _cancel_passive_keepalive(self) -> None:
@@ -645,6 +640,15 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             if confirmed:
                 return
 
+            _LOGGER.debug(
+                "Marstek passive verification mismatch: device=%s desired=%sW "
+                "command=%sW reported_mode=%s reported_power=%sW",
+                self.entry.title,
+                self._passive_desired_power,
+                self._passive_command_power,
+                mode_data.get("mode"),
+                mode_data.get("ongrid_power"),
+            )
             await self._async_send_passive_power(
                 PASSIVE_STATE_RETRYING, source="verification_retry"
             )
@@ -727,6 +731,13 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         if key in self._disabled_optional_sections:
             return None
 
+        if (
+            key == "wifi"
+            and key in self._last_good_data
+            and monotonic() < self._next_wifi_poll_at
+        ):
+            return self._last_good_data[key]
+
         result = await self.hass.async_add_executor_job(fetcher)
 
         if key == "em" and isinstance(result, dict) and result.get("ct_state") == 0:
@@ -743,6 +754,9 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         if result is not None:
             self._missing_cycles[key] = 0
             self._last_good_data[key] = result
+            if key == "wifi":
+                # Only success delays the next poll; failures retry next cycle.
+                self._next_wifi_poll_at = monotonic() + WIFI_POLL_INTERVAL_SECONDS
             return result
 
         self._missing_cycles[key] = self._missing_cycles.get(key, 0) + 1
@@ -757,15 +771,16 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             )
             return None
 
+        use_cached = self._missing_cycles[key] <= 6 and key in self._last_good_data
         _LOGGER.debug(
-            "Marstek section %s unavailable this cycle (miss %s)",
+            "Marstek section %s unavailable this cycle (miss %s; using_cached=%s)",
             key,
             self._missing_cycles[key],
+            use_cached,
         )
 
         # Keep essential data for six missed cycles; pacing/timeouts extend each cycle.
-        if self._missing_cycles[key] <= 6 and key in self._last_good_data:
-            _LOGGER.debug("Using cached Marstek section %s", key)
+        if use_cached:
             return self._last_good_data[key]
 
         return None

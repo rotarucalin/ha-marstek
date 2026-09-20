@@ -179,26 +179,27 @@ async def test_real_timer_runs_keepalive_and_retry_on_event_loop(
 async def test_new_target_and_successful_keepalive(
     coordinator, command_timers, mock_marstek_api, caplog
 ):
-    """Accepted commands use the unchanged 180s cadence and distinct sources."""
+    """New targets are logged; healthy keepalives silently maintain the cadence."""
     assert PASSIVE_POWER_KEEPALIVE_SECONDS == 180
     assert PASSIVE_POWER_RETRY_SECONDS == 15
     assert await coordinator.async_set_passive_power(240)
     assert command_timers.current.delay == 180
     assert coordinator.passive_power_state == "sent"
+    initial_logs = list(caplog.records)
     await command_timers.current.fire()
+    assert caplog.records == initial_logs
     assert command_timers.current.delay == 180
     assert mock_marstek_api.set_es_mode_passive.call_args_list == [call(240), call(240)]
     messages = outgoing_messages(caplog)
-    assert len(messages) == 2
+    assert len(messages) == 1
     assert "source=new_target" in messages[0]
-    assert "source=keepalive" in messages[1]
     for message in messages:
         assert "device=Marstek Venus A" in message
         assert "device_id=AA:BB:CC:DD:EE:01" in message
         assert "host=192.0.2.1 port=30000" in message
         assert "method=ES.SetMode mode=Passive power=240W" in message
     assert "Marstek command succeeded:" in caplog.text
-    assert "delay=180s" in caplog.text
+    assert "Marstek command scheduled:" not in caplog.text
     assert all(record.levelno == logging.DEBUG for record in caplog.records)
 
 
@@ -215,10 +216,13 @@ async def test_failed_keepalives_retry_until_success(
     await command_timers.current.fire()
     assert command_timers.current.delay == 15
     assert coordinator._passive_desired_power == 240
-    assert "source=keepalive " in outgoing_messages(caplog)[0]
+    assert not outgoing_messages(caplog)
+    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert "source=keepalive " in warnings[0].message
     assert "Marstek command succeeded:" not in caplog.text
     assert "retry in 15s" in caplog.text
-    assert "source=keepalive_retry mode=Passive power=240W delay=15s" in caplog.text
+    assert "Marstek command scheduled:" not in caplog.text
 
     caplog.clear()
     await command_timers.current.fire()
@@ -333,6 +337,8 @@ async def test_verification_resend_replaces_timer(
     assert replacement.delay == (180 if success else 15)
     assert coordinator._passive_desired_power == 240
     assert "source=verification_retry" in outgoing_messages(caplog)[0]
+    assert "Marstek passive verification mismatch:" in caplog.text
+    assert "desired=240W command=240W reported_mode=Auto reported_power=0W" in caplog.text
     assert coordinator.passive_power_state == ("retrying" if success else "sent")
     await old_timer.fire()
     assert command_timers.current is replacement

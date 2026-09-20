@@ -6,7 +6,10 @@ import pytest
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import UpdateFailed
 
-from custom_components.marstek import MarstekDataUpdateCoordinator
+from custom_components.marstek import (
+    WIFI_POLL_INTERVAL_SECONDS,
+    MarstekDataUpdateCoordinator,
+)
 from custom_components.marstek.const import DOMAIN
 
 pytestmark = pytest.mark.asyncio
@@ -44,7 +47,8 @@ async def test_first_optional_failure_stops_queries(
         assert fetcher.call_count == 1
         assert coordinator._disabled_optional_sections == {section}
         for method in ESSENTIAL.values():
-            assert getattr(mock_marstek_api, method).call_count == cycle + 1
+            expected = 1 if method == "get_wifi_status" else cycle + 1
+            assert getattr(mock_marstek_api, method).call_count == expected
     other_section = ({"ble", "pv"} - {section}).pop()
     assert getattr(mock_marstek_api, OPTIONAL[other_section]).call_count == 10
     assert caplog.text.count("skipping it until integration reload") == 1
@@ -86,12 +90,15 @@ async def test_successful_optional_responses_remain_in_polling(
 
 @pytest.mark.parametrize("section", ESSENTIAL)
 async def test_essential_endpoint_keeps_retrying_and_recovers(
-    coordinator, mock_marstek_api, section
+    coordinator, mock_marstek_api, monkeypatch, section
 ):
     """Essential data keeps its six-cycle cache and can recover after expiry."""
+    poll_time = 1000.0
+    monkeypatch.setattr("custom_components.marstek.monotonic", lambda: poll_time)
     for method in OPTIONAL.values():
         getattr(mock_marstek_api, method).return_value = None
     original = (await coordinator._async_update_data())[section]
+    poll_time += WIFI_POLL_INTERVAL_SECONDS
     fetcher = getattr(mock_marstek_api, ESSENTIAL[section])
     fetcher.return_value = None
     for misses in range(1, 8):
@@ -202,10 +209,8 @@ async def test_ct_disconnection_stops_meter_queries(
         for key, method in {**ESSENTIAL, **OPTIONAL}.items():
             if key != "em":
                 assert key in data
-                assert (
-                    getattr(mock_marstek_api, method).call_count
-                    == preceding_calls + cycle + 1
-                )
+                expected = 1 if key == "wifi" else preceding_calls + cycle + 1
+                assert getattr(mock_marstek_api, method).call_count == expected
     assert caplog.text.count("energy meter reports CT disconnected") == 1
 
 

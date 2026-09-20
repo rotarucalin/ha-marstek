@@ -179,16 +179,16 @@ power: 240 (desired discharge) -> integration learns to send 275 W -> device rep
 - Commands are clamped to a configurable **Max Passive Power** limit (default 3000 W — set it to your device's actual rated charge/discharge power under **Settings → Devices & Services → Marstek Battery System → Configure**, or at initial setup). If the desired output cannot be reached because the command is already pinned at that limit, the integration stops trying to increase it further and logs a WARNING once per bucket.
 - The keepalive and retry timers always resend the compensated command, never the raw desired value, so a Home Assistant restart or a dropped Passive session doesn't regress to an uncompensated command.
 
-Enable `custom_components.marstek: debug` in Home Assistant's logger configuration to trace operating-mode commands. Each outgoing `ES.SetMode` command and its result include the device name, BLE MAC, host/port, mode, power (when applicable), and source:
+Enable `custom_components.marstek: debug` in Home Assistant's logger configuration to trace operating-mode commands. New targets, retries, compensation changes, and mode selections include the device name, BLE MAC, host/port, mode, power (when applicable), and source:
 
 - `new_target`: a target supplied through the Passive service or number entity.
-- `keepalive`: the normal periodic refresh.
+- `keepalive`: the normal periodic refresh, logged only when it fails.
 - `keepalive_retry`: a timer retry following a failed Passive send.
 - `verification_retry`: a resend after fresh polling data fails to confirm the target.
 - `compensation`: a resend after the learned command was adjusted to close the gap between desired and actual output.
 - `operating_mode_select`: an explicit Auto, AI, or Manual selection.
 
-Successful traffic and the next timer's source/delay are logged at DEBUG. A failed command produces one WARNING with the next action; underlying transport/protocol errors add DEBUG details. A command is logged as successful only when the API returns a truthy `set_result`. Confirmation of reported mode/power remains a separate polling step.
+Routine successful keepalives and timer scheduling are silent. A failed command produces one WARNING with the next action; underlying transport/protocol errors add DEBUG details. Retry attempts and their results remain visible at DEBUG. A command is logged as successful only when the API returns a truthy `set_result`. Confirmation of reported mode/power remains a separate polling step; a verification mismatch logs the desired and commanded power alongside the reported mode and power before retrying.
 
 While a Passive target is maintained, a separate DEBUG line traces the three power values and where the command came from:
 
@@ -332,6 +332,14 @@ temporarily unresponsive. A successful response, including zero PV power or an
 empty dictionary result, keeps the section in normal polling. Wi-Fi, battery,
 energy-system, and operating-mode queries continue retrying normally.
 
+Wi-Fi status is diagnostic data and is polled on the first update, then on the
+first update at least five minutes after its last successful response. Its
+signal-strength sensor retains that reading between requests. Failed Wi-Fi
+requests retry each normal polling cycle, retaining cached data for up to six
+misses. Reloading the integration or restarting Home Assistant resets the
+Wi-Fi interval and queries it immediately. Battery, energy-system, and
+operating-mode data continue to be queried every cycle.
+
 Energy-meter polling (`EM.GetStatus`) also stops for the session after its first
 response explicitly reporting `ct_state: 0` (CT disconnected). CT Connected,
 Total Meter Power, and Phase A/B/C Power become unavailable immediately, and
@@ -362,10 +370,11 @@ check fresh logs for:
   compared with the previous logs. Persistent failures need further device
   investigation; this workaround does not establish their cause.
 
-Routine transport start/completion messages are omitted from DEBUG output.
-Request failures, command results, retries, calibration changes, and polling
-summaries are still logged. Request serialization and the 2.5-second gap apply
-regardless of logging verbosity.
+Routine transport start/completion messages, successful keepalives, and timer
+scheduling are omitted from DEBUG output. Request failures, other command
+results, retries, calibration changes, and polling summaries are still logged.
+A section's miss count and cache use share one message. Request serialization
+and the 2.5-second gap apply regardless of logging verbosity.
 
 1. Check firewall settings (UDP port must be open)
 2. Ensure static IP is set for the device

@@ -131,7 +131,9 @@ def clock():
         yield fake
 
 
-async def _settle_and_sample(coordinator, clock, actual, count=PASSIVE_STABILITY_SAMPLES):
+async def _settle_and_sample(
+    coordinator, clock, actual, count=PASSIVE_STABILITY_SAMPLES
+):
     """Advance past the settle window and feed `count` stable measurements.
 
     Mirrors one learning round: a poll cadence of stable telemetry taken after
@@ -217,7 +219,9 @@ async def test_failed_keepalives_retry_until_success(
     assert command_timers.current.delay == 15
     assert coordinator._passive_desired_power == 240
     assert not outgoing_messages(caplog)
-    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    warnings = [
+        record for record in caplog.records if record.levelno >= logging.WARNING
+    ]
     assert len(warnings) == 1
     assert "source=keepalive " in warnings[0].message
     assert "Marstek command succeeded:" not in caplog.text
@@ -331,15 +335,21 @@ async def test_verification_resend_replaces_timer(
     old_timer = command_timers.current
     mock_marstek_api.set_es_mode_passive.return_value = success
     caplog.clear()
-    await coordinator._async_verify_passive_power({"mode": "Auto", "ongrid_power": 0})
+    await coordinator._async_verify_passive_power(
+        {"mode": "Auto", "ongrid_power": 0},
+        es_data={"ongrid_power": 0},
+        fresh=frozenset({"es", "es_mode"}),
+    )
     assert not old_timer.active
     replacement = command_timers.current
     assert replacement.delay == (180 if success else 15)
     assert coordinator._passive_desired_power == 240
     assert "source=verification_retry" in outgoing_messages(caplog)[0]
     assert "Marstek passive verification mismatch:" in caplog.text
-    assert "desired=240W command=240W reported_mode=Auto reported_power=0W" in caplog.text
-    assert coordinator.passive_power_state == ("retrying" if success else "sent")
+    assert (
+        "desired=240W command=240W reported_mode=Auto reported_power=0W" in caplog.text
+    )
+    assert coordinator.passive_power_state == ("retrying" if success else "unknown")
     await old_timer.fire()
     assert command_timers.current is replacement
     assert mock_marstek_api.set_es_mode_passive.call_count == 2
@@ -352,6 +362,7 @@ async def test_poll_confirmation_and_cached_data_do_not_resend(
     timer = command_timers.current
     caplog.clear()
     mock_marstek_api.get_es_mode.return_value = {"mode": "Passive", "ongrid_power": 230}
+    mock_marstek_api.get_es_status.return_value = {"ongrid_power": 230}
     await coordinator.async_refresh()
     assert coordinator.passive_power_state == "acknowledged"
     assert command_timers.current is timer
@@ -363,11 +374,13 @@ async def test_poll_confirmation_and_cached_data_do_not_resend(
 
 
 async def test_poll_mismatch_uses_verification_provenance(
-    coordinator, command_timers, mock_marstek_api, caplog
+    coordinator, command_timers, mock_marstek_api, caplog, monkeypatch
 ):
     await coordinator.async_set_passive_power(240)
     caplog.clear()
     mock_marstek_api.get_es_mode.return_value = {"mode": "Passive", "ongrid_power": 0}
+    mock_marstek_api.get_es_status.return_value = {"ongrid_power": 0}
+    monkeypatch.setattr(coordinator, "_async_wait_passive_settle", AsyncMock())
     await coordinator.async_refresh()
     assert "source=verification_retry" in outgoing_messages(caplog)[0]
     mock_marstek_api.set_es_mode_passive.assert_called_with(240)
@@ -389,7 +402,11 @@ async def test_callback_queued_behind_superseding_command_is_invalidated(
         if action == "new_target":
             command = coordinator.async_set_passive_power(300)
         elif action == "verification":
-            command = coordinator._async_verify_passive_power({"mode": "Auto"})
+            command = coordinator._async_verify_passive_power(
+                {"mode": "Auto", "ongrid_power": 0},
+                es_data={"ongrid_power": 0},
+                fresh=frozenset({"es", "es_mode"}),
+            )
         elif action == "Auto":
             command = coordinator.async_set_operating_mode("Auto")
         else:
@@ -610,7 +627,9 @@ async def test_stale_keepalive_cannot_override_newer_compensation_command(
 
     # Two priming polls accumulate samples but are not yet enough to learn;
     # each also resends the unconfirmed, unchanged command via a fresh timer.
-    await _settle_and_sample(coordinator, clock, actual=100, count=PASSIVE_STABILITY_SAMPLES - 1)
+    await _settle_and_sample(
+        coordinator, clock, actual=100, count=PASSIVE_STABILITY_SAMPLES - 1
+    )
     stale_timer = command_timers.current
     mock_marstek_api.set_es_mode_passive.reset_mock()
     mock_marstek_api.set_es_mode_passive.return_value = True
@@ -652,8 +671,7 @@ async def test_saturation_stops_growing_and_warns_once(
         return [
             record
             for record in caplog.records
-            if record.levelno == logging.WARNING
-            and "saturated" in record.getMessage()
+            if record.levelno == logging.WARNING and "saturated" in record.getMessage()
         ]
 
     caplog.clear()
@@ -738,7 +756,9 @@ async def test_validity_gate_blocks_learning(
     assert coordinator.calibration.is_empty
 
 
-async def test_calibration_persists_across_restart(hass, marstek_entry, mock_marstek_api):
+async def test_calibration_persists_across_restart(
+    hass, marstek_entry, mock_marstek_api
+):
     """A learned mapping survives an unload/reload cycle via the Store."""
     marstek_entry.add_to_hass(hass)
     key = CALIBRATION_STORAGE_KEY_FMT.format(entry_id=marstek_entry.entry_id)

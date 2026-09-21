@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections import deque
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
@@ -48,6 +49,7 @@ from .const import (
 from .identity import CONF_DEVICE_INFO, device_metadata, normalize_mac
 from .marstek_api import MarstekAPI
 from .passive_calibration import PassiveCalibration, bucket_center, direction_of
+from .passive_telemetry import PassiveTelemetry
 from .registry import async_repair_registry
 from .services import async_register_services
 
@@ -192,6 +194,11 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._passive_keepalive_cancel: Callable[[], None] | None = None
         self._passive_command_lock = asyncio.Lock()
         self._passive_power_state = PASSIVE_STATE_UNKNOWN
+        self._passive_send_sequence = 0
+        self._passive_last_send_at = 0.0
+        self._last_passive_command: dict | None = None
+        self._passive_poll_active = False
+        self._passive_charge_recovery_blocked = False
         self._calibration_store = store
         self.calibration = PassiveCalibration.from_dict(
             calibration_data,
@@ -309,7 +316,10 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         if state == self._passive_power_state:
             return
         self._passive_power_state = state
-        self.async_update_listeners()
+        # A poll publishes its data and verification state together. In particular,
+        # recovery must not notify listeners with the pre-command zero reading.
+        if not self._passive_poll_active:
+            self.async_update_listeners()
 
     def _set_passive_command_power(self, command: int, source: str) -> None:
         """Adopt a new outgoing value and restart its measurement window."""
@@ -343,6 +353,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                     self.calibration.command_max,
                 )
             self._passive_desired_power = desired
+            self._passive_charge_recovery_blocked = False
             command, source = self.calibration.command_for(desired)
             self._set_passive_command_power(command, source)
             self._log_passive_power(source)
@@ -416,11 +427,24 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         if source != "keepalive":
             _LOGGER.debug("Marstek command: %s", context)
         error = "API returned failure (request failed or set_result missing/false)"
+        self._passive_send_sequence += 1
+        self._last_passive_command = {
+            "sequence": self._passive_send_sequence,
+            "time": datetime.now(UTC).isoformat(),
+            "source": source,
+            "mode": mode,
+            "desired_w": self._passive_desired_power,
+            "command_w": power,
+            "success": None,
+        }
         try:
             success = bool(await self.hass.async_add_executor_job(command, *args))
         except Exception as err:  # noqa: BLE001 - Keep maintenance alive on API failure.
             success = False
             error = f"{type(err).__name__}: {err}"
+
+        self._passive_last_send_at = monotonic()
+        self._last_passive_command["success"] = success
 
         if success:
             if source != "keepalive":
@@ -493,7 +517,9 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._passive_command_power = None
         self._passive_command_source = SOURCE_DIRECT
         self._passive_last_send_ok = False
+        self._passive_charge_recovery_blocked = False
         self._passive_samples.clear()
+        self._passive_send_sequence += 1
         self._cancel_passive_keepalive()
         self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
 
@@ -511,7 +537,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             self._passive_keepalive_cancel = None
             await self._async_send_passive_power(PASSIVE_STATE_SENT, source=source)
 
-    def _passive_power_is_confirmed(self, mode_data: dict) -> bool:
+    def _passive_power_is_confirmed(self, telemetry: PassiveTelemetry) -> bool:
         """Return whether fresh mode data confirms the desired real output.
 
         Compensation aims the measurement at the desired value, so confirmation
@@ -519,12 +545,12 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         """
         if (
             self._passive_desired_power is None
-            or mode_data.get("mode") != MODE_PASSIVE
+            or telemetry.mode.get("mode") != MODE_PASSIVE
         ):
             return False
 
-        reported_power = mode_data.get("ongrid_power")
-        if not isinstance(reported_power, (int, float)):
+        reported_power = telemetry.actual
+        if reported_power is None:
             return False
 
         tolerance = max(
@@ -546,18 +572,6 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             source,
         )
 
-    def _passive_measured_output(
-        self, mode_data: dict, es_data: dict | None
-    ) -> float | None:
-        """Return the measured real output, preferring the energy system status."""
-        for candidate in (
-            (es_data or {}).get("ongrid_power"),
-            mode_data.get("ongrid_power"),
-        ):
-            if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
-                return float(candidate)
-        return None
-
     def _passive_sample_is_learnable(
         self,
         mode_data: dict,
@@ -577,7 +591,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         if abs(desired) < PASSIVE_MIN_LEARN_POWER_W:
             return False
         # Never learn from the stale cache _fetch_section serves during misses.
-        if "es_mode" not in fresh or (es_data is not None and "es" not in fresh):
+        if not {"es_mode", "es", "battery"}.issubset(fresh):
             return False
         if monotonic() - self._passive_command_changed_at < PASSIVE_SETTLE_SECONDS:
             return False
@@ -605,11 +619,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
 
         # A device refusing the requested direction is constrained, not miscalibrated.
         flag = battery.get("charg_flag" if charging else "dischrg_flag")
-        other = battery.get("dischrg_flag" if charging else "charg_flag")
-        if flag is False and other is True:
-            return False
-
-        return True
+        return flag not in (False, 0)
 
     async def _async_verify_passive_power(
         self,
@@ -618,27 +628,79 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         es_data: dict | None = None,
         battery_data: dict | None = None,
         fresh: frozenset[str] = frozenset({"es_mode"}),
-    ) -> None:
+        command_sequence: int | None = None,
+        confirmed_drop: bool = False,
+        allow_send: bool = True,
+    ) -> bool:
         """Confirm the desired output, compensate for it, or retry the command."""
         async with self._passive_command_lock:
             if self._passive_desired_power is None:
-                return
+                return False
+            if (
+                command_sequence is not None
+                and command_sequence != self._passive_send_sequence
+            ):
+                self._passive_samples.clear()
+                return False
 
-            confirmed = self._passive_power_is_confirmed(mode_data)
+            telemetry = PassiveTelemetry(
+                mode_data, es_data or {}, battery_data or {}, fresh
+            )
+            actual = telemetry.actual
+            if actual is None:
+                self._passive_samples.clear()
+                self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
+                return False
+
+            interrupted = telemetry.charging_zero(self._passive_desired_power)
+            if interrupted:
+                self._passive_samples.clear()
+                self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
+                if not telemetry.charging_permitted:
+                    if confirmed_drop or not allow_send:
+                        self._passive_charge_recovery_blocked = True
+                        self._cancel_passive_keepalive()
+                        self._log_passive_observation("recovery_blocked", telemetry)
+                    return False
+                if not confirmed_drop:
+                    return False
+                if monotonic() - self._passive_last_send_at < PASSIVE_SETTLE_SECONDS:
+                    return False
+
+            confirmed = self._passive_power_is_confirmed(telemetry)
             if confirmed:
                 self._set_passive_power_state(PASSIVE_STATE_ACKNOWLEDGED)
+                if (
+                    self._passive_charge_recovery_blocked
+                    and telemetry.charging_permitted
+                ):
+                    self._passive_charge_recovery_blocked = False
+                    self._schedule_passive_keepalive(
+                        delay=PASSIVE_POWER_KEEPALIVE_SECONDS, source="keepalive"
+                    )
+            else:
+                self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
 
-            actual = self._passive_measured_output(mode_data, es_data)
-            if actual is not None:
+            if not allow_send:
+                # Post-command reads only verify. Never start an unbounded chain
+                # of retries or learn from a recovery/settling observation.
+                return False
+
+            if not interrupted:
                 self._passive_samples.append((monotonic(), actual))
 
-            if actual is not None and await self._async_compensate(
+            if not interrupted and await self._async_compensate(
                 actual, mode_data, es_data, battery_data, fresh
             ):
-                return
+                return True
 
             if confirmed:
-                return
+                return False
+
+            if self._passive_desired_power < 0 and not telemetry.charging_permitted:
+                return False
+
+            self._passive_charge_recovery_blocked = False
 
             _LOGGER.debug(
                 "Marstek passive verification mismatch: device=%s desired=%sW "
@@ -652,6 +714,131 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             await self._async_send_passive_power(
                 PASSIVE_STATE_RETRYING, source="verification_retry"
             )
+            return True
+
+    def _log_passive_observation(self, phase: str, telemetry: PassiveTelemetry) -> None:
+        """Log the evidence, including successful keepalives normally hidden."""
+        _LOGGER.debug(
+            "Marstek passive observation: %s",
+            json.dumps(
+                {
+                    "phase": phase,
+                    "device": self.entry.title,
+                    "device_id": self.device_id,
+                    "time": datetime.now(UTC).isoformat(),
+                    "desired_w": self._passive_desired_power,
+                    "command_w": self._passive_command_power,
+                    "verification_state": self._passive_power_state,
+                    "endpoint_disagreement": telemetry.disagreement,
+                    "preceding_command": self._last_passive_command,
+                    "seconds_since_command": (
+                        round(monotonic() - self._passive_last_send_at, 3)
+                        if self._last_passive_command
+                        else None
+                    ),
+                    **telemetry.diagnostic_data(),
+                },
+                sort_keys=True,
+            ),
+        )
+
+    async def _async_read_passive_telemetry(
+        self, data: dict
+    ) -> tuple[int, PassiveTelemetry]:
+        """Replace the poll's readings with a paced, bounded follow-up round."""
+        sequence = self._passive_send_sequence
+        fresh = set()
+        for key, fetcher in (
+            ("battery", self.api.get_battery_status),
+            ("es", self.api.get_es_status),
+            ("es_mode", self.api.get_es_mode),
+        ):
+            # Do not reuse pre-command readings, even when the follow-up fails.
+            data.pop(key, None)
+            result = await self._fetch_section(key, fetcher)
+            if self._missing_cycles.get(key) == 0 and result is not None:
+                data[key] = result
+                fresh.add(key)
+            else:
+                self._last_good_data.pop(key, None)
+        return sequence, PassiveTelemetry(
+            data.get("es_mode", {}),
+            data.get("es", {}),
+            data.get("battery", {}),
+            frozenset(fresh),
+        )
+
+    async def _async_wait_passive_settle(self) -> None:
+        """Allow recovery to settle without blocking newer targets or mode changes."""
+        remaining = PASSIVE_SETTLE_SECONDS - (monotonic() - self._passive_last_send_at)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+    def _discard_superseded_passive_readings(self, data: dict) -> None:
+        """Do not publish a power snapshot spanning two different commands."""
+        self._passive_samples.clear()
+        for key in ("es", "es_mode"):
+            data.pop(key, None)
+            self._last_good_data.pop(key, None)
+
+    async def _async_process_passive_telemetry(self, data: dict, sequence: int) -> None:
+        """Confirm interruptions once and publish only post-recovery telemetry."""
+        if self._passive_desired_power is None:
+            return
+        fresh = frozenset(
+            key
+            for key in ("battery", "es", "es_mode")
+            if key in data and self._missing_cycles.get(key) == 0
+        )
+        telemetry = PassiveTelemetry(
+            data.get("es_mode", {}),
+            data.get("es", {}),
+            data.get("battery", {}),
+            fresh,
+        )
+        if sequence != self._passive_send_sequence:
+            self._discard_superseded_passive_readings(data)
+            return
+        suspect = telemetry.disagreement or telemetry.charging_zero(
+            self._passive_desired_power
+        )
+        if suspect:
+            self._passive_samples.clear()
+            self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
+            self._log_passive_observation("suspected_interruption", telemetry)
+            if monotonic() - self._passive_last_send_at < PASSIVE_SETTLE_SECONDS:
+                await self._async_wait_passive_settle()
+            sequence, telemetry = await self._async_read_passive_telemetry(data)
+            self._log_passive_observation("confirmation", telemetry)
+
+        sent = await self._async_verify_passive_power(
+            telemetry.mode,
+            es_data=telemetry.es,
+            battery_data=telemetry.battery,
+            fresh=telemetry.fresh,
+            command_sequence=sequence,
+            confirmed_drop=suspect,
+        )
+        if not sent:
+            if sequence != self._passive_send_sequence:
+                self._discard_superseded_passive_readings(data)
+            return
+
+        # A recovery command cannot make the previously collected data current.
+        # Leave the command lock free during settling so stops/new targets win.
+        await self._async_wait_passive_settle()
+        sequence, telemetry = await self._async_read_passive_telemetry(data)
+        await self._async_verify_passive_power(
+            telemetry.mode,
+            es_data=telemetry.es,
+            battery_data=telemetry.battery,
+            fresh=telemetry.fresh,
+            command_sequence=sequence,
+            allow_send=False,
+        )
+        self._log_passive_observation("post_recovery", telemetry)
+        if sequence != self._passive_send_sequence:
+            self._discard_superseded_passive_readings(data)
 
     async def _async_compensate(
         self,
@@ -787,6 +974,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self):
         """Update data via library."""
+        self._passive_poll_active = True
         try:
             data = {}
 
@@ -801,6 +989,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             if ble_status is not None:
                 data["ble"] = ble_status
 
+            passive_sequence = self._passive_send_sequence
             bat_status = await self._fetch_section(
                 "battery", self.api.get_battery_status
             )
@@ -818,17 +1007,8 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             es_mode = await self._fetch_section("es_mode", self.api.get_es_mode)
             if es_mode is not None:
                 data["es_mode"] = es_mode
-                if self._missing_cycles.get("es_mode") == 0:
-                    await self._async_verify_passive_power(
-                        es_mode,
-                        es_data=data.get("es"),
-                        battery_data=data.get("battery"),
-                        fresh=frozenset(
-                            key
-                            for key, misses in self._missing_cycles.items()
-                            if misses == 0
-                        ),
-                    )
+
+            await self._async_process_passive_telemetry(data, passive_sequence)
 
             em_status = await self._fetch_section("em", self.api.get_em_status)
             if em_status is not None:
@@ -845,3 +1025,5 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             raise
         except Exception as err:
             raise UpdateFailed(f"Error communicating with API: {err}") from err
+        finally:
+            self._passive_poll_active = False

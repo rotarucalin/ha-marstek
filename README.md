@@ -392,6 +392,35 @@ and the 2.5-second gap apply regardless of logging verbosity.
 
 ### Enable Debug Logging
 
+Passive control acknowledges output only when fresh `ES.GetStatus` and
+`ES.GetMode` power readings agree. The energy-system status remains the measured
+output used by both verification and calibration. Cached, missing, invalid, or
+conflicting readings cannot acknowledge a command or enter calibration.
+
+An unexpected near-zero reading while charging, or disagreement between the
+endpoints, triggers one follow-up round through the existing 2.5-second request
+gate. A confirmed charging interruption resends the maintained compensated
+command only with fresh charging permission and SOC below 100%. Unknown or denied
+permission pauses automatic maintenance until fresh telemetry permits recovery;
+the desired target is retained. Interruption samples are excluded from learning.
+
+After a verification retry or compensation command, the poll waits for the
+15-second settling period and reads battery, energy-system, and mode status
+again before publishing. A failed follow-up leaves that section unavailable
+instead of publishing a cached pre-command reading. The follow-up only verifies;
+further recovery waits for the next poll or retry timer. New targets and mode
+changes can still run while the poll waits for settling.
+
+Debug records beginning `Marstek passive observation:` contain JSON with the
+suspected interruption, confirmation, blocked recovery, and post-recovery phases.
+They include both power readings and their freshness, mode, SOC, charging
+permission, temperature, energy counters, and the preceding command's timestamp,
+sequence, source, compensated power, and success. Successful keepalives appear in
+this preceding-command context even though their routine messages are suppressed.
+Energy counters retain the device's raw units; compare counters and timestamps
+across events to investigate charging-progress relationships without assuming a
+firmware cause or converting missing data to zero.
+
 Add to `configuration.yaml`:
 
 ```yaml

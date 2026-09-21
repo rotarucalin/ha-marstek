@@ -1,4 +1,4 @@
-"""Exercise charging interruption recovery through real coordinator polling."""
+"""Exercise passive interruption recovery through real coordinator polling."""
 
 import asyncio
 import json
@@ -30,23 +30,24 @@ def mode(power):
 
 
 @pytest.fixture
-async def recovery(hass, marstek_entry, mock_marstek_api, monkeypatch, caplog):
-    """Start with an acknowledged, calibrated charging target."""
+async def recovery(hass, marstek_entry, mock_marstek_api, monkeypatch, caplog, request):
+    """Start with an acknowledged, calibrated target."""
+    desired = getattr(request, "param", -768)
     marstek_entry.add_to_hass(hass)
     clock = SimpleNamespace(now=1000.0)
     monkeypatch.setattr("custom_components.marstek.monotonic", lambda: clock.now)
     caplog.set_level(logging.DEBUG, logger="custom_components.marstek")
     coordinator = MarstekDataUpdateCoordinator(hass, mock_marstek_api, marstek_entry)
-    mock_marstek_api.get_es_status.return_value = status(-768)
-    mock_marstek_api.get_es_mode.return_value = mode(-768)
+    mock_marstek_api.get_es_status.return_value = status(desired)
+    mock_marstek_api.get_es_mode.return_value = mode(desired)
     mock_marstek_api.get_battery_status.return_value = {
         "soc": 50,
         "charg_flag": True,
         "dischrg_flag": True,
         "bat_temp": 27,
     }
-    coordinator.calibration.observe(-768, -768, -781)
-    await coordinator.async_set_passive_power(-768)
+    coordinator.calibration.observe(desired, desired, desired - 13)
+    await coordinator.async_set_passive_power(desired)
     clock.now += PASSIVE_SETTLE_SECONDS + 1
     await coordinator.async_refresh()
     assert coordinator.passive_power_state == "acknowledged"
@@ -72,6 +73,7 @@ def observations(caplog):
     ]
 
 
+@pytest.mark.parametrize("recovery", [-760, 340], indirect=True)
 async def test_confirmed_zero_recovers_compensated_target_and_publishes_new_data(
     recovery,
     caplog,
@@ -79,8 +81,9 @@ async def test_confirmed_zero_recovers_compensated_target_and_publishes_new_data
     coordinator, api, _ = recovery
     original_map = coordinator.calibration_snapshot()
     original_command = coordinator.command_power
-    api.get_es_status.side_effect = [status(0), status(0), status(-768, 12.49)]
-    api.get_es_mode.side_effect = [mode(0), mode(0), mode(-768)]
+    desired = coordinator.desired_power
+    api.get_es_status.side_effect = [status(0), status(0), status(desired, 12.49)]
+    api.get_es_mode.side_effect = [mode(0), mode(0), mode(desired)]
     published = []
     cancel = coordinator.async_add_listener(
         lambda: published.append(
@@ -92,10 +95,10 @@ async def test_confirmed_zero_recovers_compensated_target_and_publishes_new_data
     finally:
         cancel()
     api.set_es_mode_passive.assert_called_once_with(original_command)
-    assert coordinator.desired_power == -768
+    assert coordinator.desired_power == desired
     assert coordinator.calibration_snapshot() == original_map
     assert not coordinator._passive_samples
-    assert published == [(-768, "acknowledged")]
+    assert published == [(desired, "acknowledged")]
     assert coordinator.data["es"]["total_grid_input_energy"] == 12.49
     events = observations(caplog)
     assert [event["phase"] for event in events] == [
@@ -111,6 +114,37 @@ async def test_confirmed_zero_recovers_compensated_target_and_publishes_new_data
     assert before["preceding_command"]["command_w"] == original_command
     assert before["preceding_command"]["success"] is True
     assert events[-1]["preceding_command"]["source"] == "verification_retry"
+    assert api.get_es_status.call_count == api.get_es_mode.call_count == 3
+
+
+@pytest.mark.parametrize("recovery", [-760, 340], indirect=True)
+async def test_transient_zero_marks_unknown_before_confirmation_without_resending(
+    recovery, monkeypatch, caplog
+):
+    coordinator, api, _ = recovery
+    desired = coordinator.desired_power
+    original_map = coordinator.calibration_snapshot()
+    api.get_es_status.side_effect = [status(0), status(desired)]
+    api.get_es_mode.side_effect = [mode(0), mode(desired)]
+    read = coordinator._async_read_passive_telemetry
+
+    async def confirm(data):
+        assert coordinator.passive_power_state == "unknown"
+        assert not coordinator._passive_samples
+        api.set_es_mode_passive.assert_not_called()
+        return await read(data)
+
+    monkeypatch.setattr(coordinator, "_async_read_passive_telemetry", confirm)
+    await coordinator.async_refresh()
+    api.set_es_mode_passive.assert_not_called()
+    assert coordinator.passive_power_state == "acknowledged"
+    assert coordinator.calibration_snapshot() == original_map
+    assert [power for _, power in coordinator._passive_samples] == [desired]
+    assert api.get_es_status.call_count == api.get_es_mode.call_count == 2
+    assert [event["phase"] for event in observations(caplog)] == [
+        "suspected_interruption",
+        "confirmation",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -157,6 +191,7 @@ async def test_cached_endpoint_cannot_acknowledge_or_learn(recovery, missing):
     api.set_es_mode_passive.assert_not_called()
 
 
+@pytest.mark.parametrize("recovery", [-760, 340], indirect=True)
 @pytest.mark.parametrize(
     "battery",
     [
@@ -168,7 +203,7 @@ async def test_cached_endpoint_cannot_acknowledge_or_learn(recovery, missing):
         None,
     ],
 )
-async def test_zero_recovery_requires_fresh_charging_permission(
+async def test_zero_recovery_requires_fresh_charging_permission_only_for_charging(
     recovery, battery, caplog
 ):
     coordinator, api, _ = recovery
@@ -176,11 +211,24 @@ async def test_zero_recovery_requires_fresh_charging_permission(
     api.get_es_mode.return_value = mode(0)
     api.get_battery_status.return_value = battery
     await coordinator.async_refresh()
-    api.set_es_mode_passive.assert_not_called()
     assert coordinator.passive_power_state == "unknown"
-    assert coordinator._passive_keepalive_cancel is None
-    assert observations(caplog)[-1]["phase"] == "recovery_blocked"
-    assert coordinator.desired_power == -768
+    assert not coordinator._passive_samples
+    if coordinator.desired_power < 0:
+        api.set_es_mode_passive.assert_not_called()
+        assert coordinator._passive_keepalive_cancel is None
+        assert coordinator._passive_charge_recovery_blocked
+        assert observations(caplog)[-1]["phase"] == "recovery_blocked"
+    else:
+        api.set_es_mode_passive.assert_called_once_with(coordinator.command_power)
+        assert coordinator._passive_keepalive_cancel is not None
+        assert not coordinator._passive_charge_recovery_blocked
+        events = observations(caplog)
+        assert [event["phase"] for event in events] == [
+            "suspected_interruption",
+            "confirmation",
+            "post_recovery",
+        ]
+        assert events[-1]["preceding_command"]["source"] == "verification_retry"
 
 
 async def test_charging_permission_returning_allows_recovery(recovery):
@@ -198,6 +246,7 @@ async def test_charging_permission_returning_allows_recovery(recovery):
     assert coordinator._passive_keepalive_cancel is not None
 
 
+@pytest.mark.parametrize("recovery", [-760, 340], indirect=True)
 @pytest.mark.parametrize("response", [0, None])
 async def test_failed_or_zero_post_recovery_read_does_not_loop_or_reuse_cache(
     recovery, response
@@ -217,6 +266,7 @@ async def test_failed_or_zero_post_recovery_read_does_not_loop_or_reuse_cache(
     api.set_es_mode_passive.assert_called_once_with(coordinator.command_power)
     assert coordinator.passive_power_state == "unknown"
     assert not coordinator._passive_samples
+    assert api.get_es_status.call_count == api.get_es_mode.call_count == 3
     if response is None:
         assert "es" not in coordinator.data
         assert "es_mode" not in coordinator.data

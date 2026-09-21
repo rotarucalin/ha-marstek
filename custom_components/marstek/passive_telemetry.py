@@ -46,11 +46,11 @@ class PassiveTelemetry:
             return None
         return self.power("es")
 
-    def charging_zero(self, desired: int | None) -> bool:
+    def unexpected_zero(self, desired: int | None) -> bool:
         """A fresh zero in either endpoint merits confirmation, never learning."""
         return (
             desired is not None
-            and desired < -ZERO_POWER_TOLERANCE_W
+            and abs(desired) > ZERO_POWER_TOLERANCE_W
             and any(
                 power is not None and abs(power) <= ZERO_POWER_TOLERANCE_W
                 for power in (self.power("es"), self.power("es_mode"))

@@ -328,10 +328,11 @@ async def test_selecting_passive_does_not_send_or_replace_target(
 
 @pytest.mark.parametrize("success", [True, False])
 async def test_verification_resend_replaces_timer(
-    coordinator, command_timers, mock_marstek_api, caplog, success
+    coordinator, command_timers, mock_marstek_api, caplog, clock, success
 ):
-    """Fresh unconfirmed telemetry resends the target, with its own provenance."""
+    """A confirmed interruption resends the target, with its own provenance."""
     await coordinator.async_set_passive_power(240)
+    clock.advance(PASSIVE_SETTLE_SECONDS + 1)
     old_timer = command_timers.current
     mock_marstek_api.set_es_mode_passive.return_value = success
     caplog.clear()
@@ -339,6 +340,7 @@ async def test_verification_resend_replaces_timer(
         {"mode": "Auto", "ongrid_power": 0},
         es_data={"ongrid_power": 0},
         fresh=frozenset({"es", "es_mode"}),
+        confirmed_drop=True,
     )
     assert not old_timer.active
     replacement = command_timers.current
@@ -374,9 +376,10 @@ async def test_poll_confirmation_and_cached_data_do_not_resend(
 
 
 async def test_poll_mismatch_uses_verification_provenance(
-    coordinator, command_timers, mock_marstek_api, caplog, monkeypatch
+    coordinator, command_timers, mock_marstek_api, caplog, monkeypatch, clock
 ):
     await coordinator.async_set_passive_power(240)
+    clock.advance(PASSIVE_SETTLE_SECONDS + 1)
     caplog.clear()
     mock_marstek_api.get_es_mode.return_value = {"mode": "Passive", "ongrid_power": 0}
     mock_marstek_api.get_es_status.return_value = {"ongrid_power": 0}
@@ -389,11 +392,12 @@ async def test_poll_mismatch_uses_verification_provenance(
 
 @pytest.mark.parametrize("action", ["new_target", "verification", "Auto", "stop"])
 async def test_callback_queued_behind_superseding_command_is_invalidated(
-    coordinator, command_timers, mock_marstek_api, action
+    coordinator, command_timers, mock_marstek_api, clock, action
 ):
     """A callback waiting for the lock cannot send or discard a newer timer."""
     mock_marstek_api.set_es_mode_passive.return_value = False
     await coordinator.async_set_passive_power(240)
+    clock.advance(PASSIVE_SETTLE_SECONDS + 1)
     timer = command_timers.current
     mock_marstek_api.set_es_mode_passive.reset_mock()
     mock_marstek_api.set_es_mode_passive.return_value = True
@@ -406,6 +410,7 @@ async def test_callback_queued_behind_superseding_command_is_invalidated(
                 {"mode": "Auto", "ongrid_power": 0},
                 es_data={"ongrid_power": 0},
                 fresh=frozenset({"es", "es_mode"}),
+                confirmed_drop=True,
             )
         elif action == "Auto":
             command = coordinator.async_set_operating_mode("Auto")
@@ -785,3 +790,54 @@ async def test_calibration_persists_across_restart(
     assert await new_coordinator.async_set_passive_power(240)
     mock_marstek_api.set_es_mode_passive.assert_called_once_with(275)
     await new_coordinator.async_stop_passive_control()
+
+
+@pytest.mark.parametrize("desired", [-760, 340])
+@pytest.mark.parametrize("confirmed_drop", [False, True])
+async def test_unexpected_zero_never_enters_adaptive_compensation(
+    coordinator, mock_marstek_api, clock, desired, confirmed_drop
+):
+    await coordinator.async_set_passive_power(desired)
+    mock_marstek_api.set_es_mode_passive.reset_mock()
+    original_map = coordinator.calibration_snapshot()
+    with patch.object(
+        coordinator, "_async_compensate", wraps=coordinator._async_compensate
+    ) as compensate:
+        for _ in range(PASSIVE_STABILITY_SAMPLES):
+            clock.advance(PASSIVE_SETTLE_SECONDS + 1)
+            coordinator._passive_samples.append((clock(), desired))
+            sent = await coordinator._async_verify_passive_power(
+                {"mode": "Passive", "ongrid_power": 0},
+                es_data={"ongrid_power": 0},
+                battery_data={"soc": 50, "charg_flag": True, "dischrg_flag": True},
+                fresh=frozenset({"es_mode", "es", "battery"}),
+                confirmed_drop=confirmed_drop,
+            )
+            assert sent is confirmed_drop
+            assert not coordinator._passive_samples
+            assert coordinator.calibration_snapshot() == original_map
+        compensate.assert_not_awaited()
+    assert mock_marstek_api.set_es_mode_passive.call_count == (
+        PASSIVE_STABILITY_SAMPLES if confirmed_drop else 0
+    )
+    if not confirmed_drop:
+        assert coordinator.passive_power_state == "unknown"
+
+
+@pytest.mark.parametrize("desired", [-760, 340])
+async def test_confirmed_zero_inside_settle_window_does_not_resend(
+    coordinator, mock_marstek_api, clock, desired
+):
+    await coordinator.async_set_passive_power(desired)
+    mock_marstek_api.set_es_mode_passive.reset_mock()
+    sent = await coordinator._async_verify_passive_power(
+        {"mode": "Passive", "ongrid_power": 0},
+        es_data={"ongrid_power": 0},
+        battery_data={"soc": 50, "charg_flag": True},
+        fresh=frozenset({"es_mode", "es", "battery"}),
+        confirmed_drop=True,
+    )
+    assert not sent
+    mock_marstek_api.set_es_mode_passive.assert_not_called()
+    assert coordinator.passive_power_state == "unknown"
+    assert not coordinator._passive_samples

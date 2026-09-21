@@ -652,11 +652,11 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
                 return False
 
-            interrupted = telemetry.charging_zero(self._passive_desired_power)
+            interrupted = telemetry.unexpected_zero(self._passive_desired_power)
             if interrupted:
                 self._passive_samples.clear()
                 self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
-                if not telemetry.charging_permitted:
+                if self._passive_desired_power < 0 and not telemetry.charging_permitted:
                     if confirmed_drop or not allow_send:
                         self._passive_charge_recovery_blocked = True
                         self._cancel_passive_keepalive()
@@ -671,7 +671,8 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             if confirmed:
                 self._set_passive_power_state(PASSIVE_STATE_ACKNOWLEDGED)
                 if (
-                    self._passive_charge_recovery_blocked
+                    self._passive_desired_power < 0
+                    and self._passive_charge_recovery_blocked
                     and telemetry.charging_permitted
                 ):
                     self._passive_charge_recovery_blocked = False
@@ -697,10 +698,10 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             if confirmed:
                 return False
 
-            if self._passive_desired_power < 0 and not telemetry.charging_permitted:
-                return False
-
-            self._passive_charge_recovery_blocked = False
+            if self._passive_desired_power < 0:
+                if not telemetry.charging_permitted:
+                    return False
+                self._passive_charge_recovery_blocked = False
 
             _LOGGER.debug(
                 "Marstek passive verification mismatch: device=%s desired=%sW "
@@ -799,7 +800,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         if sequence != self._passive_send_sequence:
             self._discard_superseded_passive_readings(data)
             return
-        suspect = telemetry.disagreement or telemetry.charging_zero(
+        suspect = telemetry.disagreement or telemetry.unexpected_zero(
             self._passive_desired_power
         )
         if suspect:

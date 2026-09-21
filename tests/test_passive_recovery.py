@@ -390,4 +390,6 @@ async def test_failed_recovery_write_is_followed_by_measurement_without_an_inlin
     api.set_es_mode_passive.assert_called_once_with(coordinator.command_power)
     assert api.get_es_status.call_count == api.get_es_mode.call_count == 3
     assert coordinator.passive_power_state == "unknown"
-    assert coordinator._passive_keepalive_cancel is not None
+    assert coordinator._passive_keepalive_cancel is None
+    assert coordinator._passive_retry is not None
+    assert coordinator._passive_retry.source == "verification_retry"

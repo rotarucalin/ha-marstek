@@ -8,6 +8,7 @@ import logging
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from homeassistant.config_entries import ConfigEntry
@@ -73,6 +74,17 @@ PASSIVE_POWER_KEEPALIVE_SECONDS = 180
 PASSIVE_POWER_RETRY_SECONDS = 15
 PASSIVE_POWER_TOLERANCE = 0.20
 PASSIVE_POWER_ZERO_TOLERANCE = 10
+
+
+@dataclass
+class PassiveCommandRetry:
+    """The single recovery callback and the failed command it belongs to."""
+
+    sequence: int
+    desired_w: int
+    command_w: int
+    source: str
+    cancel: Callable[[], None] | None = None
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -192,6 +204,10 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._passive_saturated_buckets: set[tuple[str, int]] = set()
         self._passive_control_generation = 0
         self._passive_keepalive_cancel: Callable[[], None] | None = None
+        self._passive_retry: PassiveCommandRetry | None = None
+        self._passive_command_in_flight = False
+        self._passive_target_generation = 0
+        self._passive_last_success_sequence = 0
         self._passive_command_lock = asyncio.Lock()
         self._passive_power_state = PASSIVE_STATE_UNKNOWN
         self._passive_send_sequence = 0
@@ -330,7 +346,15 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def async_set_passive_power(self, power: int) -> bool:
         """Set and maintain a desired real output for passive mode."""
+        # Invalidate queued recovery before waiting for an in-flight command.
+        # Its completion must not start recovery for the superseded target.
+        self._passive_target_generation += 1
+        generation = self._passive_target_generation
+        self._cancel_passive_retry()
+        self._cancel_passive_keepalive()
         async with self._passive_command_lock:
+            if generation != self._passive_target_generation:
+                return False
             if self._identity_mismatch:
                 _LOGGER.warning(
                     "Marstek command blocked: device=%s source=new_target "
@@ -463,7 +487,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
     async def _async_send_passive_power(
         self, outcome_state: str, *, source: str
     ) -> bool:
-        """Send the current command and replace the shared keepalive/retry timer.
+        """Send the current command and schedule either keepalive or recovery.
 
         The compensated command power goes on the wire, never the desired output.
         """
@@ -472,24 +496,117 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
 
         # Also invalidate callbacks which have fired but are waiting for the lock.
         self._cancel_passive_keepalive()
-        success = await self._async_send_mode_command(
-            mode=MODE_PASSIVE, power=self._passive_command_power, source=source
-        )
-        self._passive_last_send_ok = success
-        self._schedule_passive_keepalive(
-            delay=(
-                PASSIVE_POWER_KEEPALIVE_SECONDS
-                if success
-                else PASSIVE_POWER_RETRY_SECONDS
-            ),
-            source="keepalive" if success else "keepalive_retry",
-        )
+        self._cancel_passive_retry()
+        generation = self._passive_target_generation
+        self._passive_command_in_flight = True
+        try:
+            success = await self._async_send_mode_command(
+                mode=MODE_PASSIVE, power=self._passive_command_power, source=source
+            )
+        finally:
+            self._passive_command_in_flight = False
         if success:
+            self._passive_last_success_sequence = self._passive_send_sequence
+        if generation != self._passive_target_generation:
+            return success
+        self._passive_last_send_ok = success
+        if success:
+            self._schedule_passive_keepalive(
+                delay=PASSIVE_POWER_KEEPALIVE_SECONDS, source="keepalive"
+            )
             self._set_passive_power_state(outcome_state)
+        else:
+            self._passive_samples.clear()
+            self._schedule_passive_retry(source)
         return success
 
+    def _log_passive_recovery(
+        self, event: str, retry: PassiveCommandRetry | None = None
+    ) -> None:
+        """Include the failed command's original provenance in recovery logs."""
+        retry = retry or self._passive_retry
+        command = self._last_passive_command or {}
+        source = retry.source if retry else command.get("source", "unknown")
+        if source != "verification_retry":
+            source = source.removesuffix("_retry")
+        _LOGGER.debug(
+            "Marstek passive %s: device=%s sequence=%s desired_w=%s "
+            "command_w=%s original_source=%s",
+            event,
+            self.entry.title,
+            retry.sequence if retry else self._passive_send_sequence,
+            retry.desired_w if retry else self._passive_desired_power,
+            retry.command_w if retry else self._passive_command_power,
+            source,
+        )
+
+    def _passive_recovery_pending(self, source: str) -> bool:
+        """Suppress other command producers while recovery owns the command."""
+        if self._passive_command_in_flight or self._passive_retry is not None:
+            self._log_passive_recovery(
+                f"{source} suppressed because recovery is pending"
+            )
+            return True
+        return False
+
+    def _schedule_passive_retry(self, source: str) -> None:
+        """Schedule just one retry, preserving the origin across failures."""
+        if self._passive_retry is not None:
+            return
+        retry = PassiveCommandRetry(
+            self._passive_send_sequence,
+            self._passive_desired_power,
+            self._passive_command_power,
+            source if source == "verification_retry" else source.removesuffix("_retry"),
+        )
+        self._passive_retry = retry
+
+        async def async_retry(_now: datetime) -> None:
+            await self._async_retry_passive_power(retry)
+
+        retry.cancel = async_call_later(
+            self.hass, PASSIVE_POWER_RETRY_SECONDS, async_retry
+        )
+        self._log_passive_recovery("retry scheduled", retry)
+
+    def _cancel_passive_retry(self) -> None:
+        """Cancel recovery, including a callback already waiting for the lock."""
+        if (retry := self._passive_retry) is None:
+            return
+        self._passive_retry = None
+        if retry.cancel is not None:
+            retry.cancel()
+        self._log_passive_recovery("retry cancelled", retry)
+
+    async def _async_retry_passive_power(self, retry: PassiveCommandRetry) -> None:
+        """Only the active failed command may consume the recovery slot."""
+        async with self._passive_command_lock:
+            if (
+                retry is not self._passive_retry
+                or retry.sequence != self._passive_send_sequence
+                or retry.desired_w != self._passive_desired_power
+                or retry.command_w != self._passive_command_power
+                or self._passive_last_success_sequence > retry.sequence
+            ):
+                self._log_passive_recovery("stale retry discarded", retry)
+                return
+            self._passive_retry = None
+            # Failed sends and their observations must not contribute samples
+            # to calibration after recovery succeeds.
+            self._passive_samples.clear()
+            await self._async_send_passive_power(
+                PASSIVE_STATE_SENT,
+                source=(
+                    retry.source
+                    if retry.source.endswith("_retry")
+                    else f"{retry.source}_retry"
+                ),
+            )
+            # The network request itself can outlast the settle period.
+            self._passive_command_changed_at = self._passive_last_send_at
+
     def _schedule_passive_keepalive(self, *, delay: int, source: str) -> None:
-        """Replace the one command-only timer after either success or failure."""
+        """Restart normal maintenance after a successful command."""
         self._cancel_passive_keepalive()
         generation = self._passive_control_generation
 
@@ -513,6 +630,8 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
 
         The learned calibration deliberately survives; only the live target does not.
         """
+        self._passive_target_generation += 1
+        self._cancel_passive_retry()
         self._passive_desired_power = None
         self._passive_command_power = None
         self._passive_command_source = SOURCE_DIRECT
@@ -527,7 +646,11 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self, generation: int, *, source: str
     ) -> None:
         """Resend the passive command power when its keepalive is due."""
+        if self._passive_recovery_pending("keepalive"):
+            return
         async with self._passive_command_lock:
+            if self._passive_recovery_pending("keepalive"):
+                return
             if (
                 generation != self._passive_control_generation
                 or self._passive_command_power is None
@@ -633,12 +756,21 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         allow_send: bool = True,
     ) -> bool:
         """Confirm the desired output, compensate for it, or retry the command."""
+        # Check before locking so an observation made during ES.SetMode cannot
+        # wait for its completion and then start a second recovery operation.
+        if self._passive_recovery_pending("verification"):
+            return False
+        generation = self._passive_target_generation
+        if command_sequence is None:
+            command_sequence = self._passive_send_sequence
         async with self._passive_command_lock:
+            if self._passive_recovery_pending("verification"):
+                return False
             if self._passive_desired_power is None:
                 return False
             if (
-                command_sequence is not None
-                and command_sequence != self._passive_send_sequence
+                generation != self._passive_target_generation
+                or command_sequence != self._passive_send_sequence
             ):
                 self._passive_samples.clear()
                 return False

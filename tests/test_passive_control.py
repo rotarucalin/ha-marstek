@@ -390,7 +390,7 @@ async def test_poll_mismatch_uses_verification_provenance(
     assert command_timers.current.delay == 180
 
 
-@pytest.mark.parametrize("action", ["new_target", "verification", "Auto", "stop"])
+@pytest.mark.parametrize("action", ["new_target", "Auto", "stop"])
 async def test_callback_queued_behind_superseding_command_is_invalidated(
     coordinator, command_timers, mock_marstek_api, clock, action
 ):
@@ -405,13 +405,7 @@ async def test_callback_queued_behind_superseding_command_is_invalidated(
     try:
         if action == "new_target":
             command = coordinator.async_set_passive_power(300)
-        elif action == "verification":
-            command = coordinator._async_verify_passive_power(
-                {"mode": "Auto", "ongrid_power": 0},
-                es_data={"ongrid_power": 0},
-                fresh=frozenset({"es", "es_mode"}),
-                confirmed_drop=True,
-            )
+
         elif action == "Auto":
             command = coordinator.async_set_operating_mode("Auto")
         else:
@@ -423,10 +417,8 @@ async def test_callback_queued_behind_superseding_command_is_invalidated(
     finally:
         coordinator._passive_command_lock.release()
     await asyncio.gather(superseding, queued)
-    if action in ("new_target", "verification"):
-        mock_marstek_api.set_es_mode_passive.assert_called_once_with(
-            300 if action == "new_target" else 240
-        )
+    if action == "new_target":
+        mock_marstek_api.set_es_mode_passive.assert_called_once_with(300)
         assert command_timers.current.delay == 180
     else:
         mock_marstek_api.set_es_mode_passive.assert_not_called()
@@ -841,3 +833,267 @@ async def test_confirmed_zero_inside_settle_window_does_not_resend(
     mock_marstek_api.set_es_mode_passive.assert_not_called()
     assert coordinator.passive_power_state == "unknown"
     assert not coordinator._passive_samples
+
+
+async def verify_mismatch(coordinator):
+    """An actionable, confirmed mismatch that would otherwise resend."""
+    return await coordinator._async_verify_passive_power(
+        {"mode": "Passive", "ongrid_power": 0},
+        es_data={"ongrid_power": 0},
+        fresh=frozenset({"es", "es_mode"}),
+        confirmed_drop=True,
+    )
+
+
+@pytest.mark.parametrize("origin", ["new_target", "keepalive", "verification_retry"])
+async def test_one_retry_path_preserves_origin_until_success(
+    coordinator, command_timers, mock_marstek_api, clock, caplog, origin
+):
+    """Verification and keepalive cannot multiply any failed command's retries."""
+    coordinator.calibration.observe(240, 240, 227)
+    original_map = coordinator.calibration_snapshot()
+    if origin == "new_target":
+        mock_marstek_api.set_es_mode_passive.return_value = False
+        assert not await coordinator.async_set_passive_power(240)
+    else:
+        await coordinator.async_set_passive_power(240)
+        mock_marstek_api.set_es_mode_passive.return_value = False
+        clock.advance(PASSIVE_POWER_KEEPALIVE_SECONDS)
+        if origin == "keepalive":
+            await command_timers.current.fire()
+        else:
+            assert await verify_mismatch(coordinator)
+
+    first_retry = command_timers.current
+    for _ in range(3):
+        retry = coordinator._passive_retry
+        timer = command_timers.current
+        assert timer.delay == PASSIVE_POWER_RETRY_SECONDS
+        assert (retry.desired_w, retry.command_w, retry.source) == (240, 253, origin)
+        assert coordinator._passive_keepalive_cancel is None
+        calls = mock_marstek_api.set_es_mode_passive.call_count
+        clock.advance(PASSIVE_SETTLE_SECONDS + 1)
+        assert not await verify_mismatch(coordinator)
+        await coordinator._async_keepalive_passive_power(
+            coordinator._passive_control_generation, source="keepalive"
+        )
+        assert coordinator._passive_retry is retry
+        assert command_timers.current is timer
+        assert mock_marstek_api.set_es_mode_passive.call_count == calls
+        assert coordinator.calibration_snapshot() == original_map
+        assert not coordinator._passive_samples
+        await timer.fire()
+        assert mock_marstek_api.set_es_mode_passive.call_count == calls + 1
+        assert coordinator._passive_retry.sequence > retry.sequence
+
+    mock_marstek_api.set_es_mode_passive.return_value = True
+    await command_timers.current.fire()
+    assert coordinator._passive_retry is None
+    assert not coordinator._passive_command_in_flight
+    assert coordinator._passive_last_send_ok
+    assert coordinator.passive_power_state == "sent"
+    assert command_timers.current.delay == PASSIVE_POWER_KEEPALIVE_SECONDS
+    assert all(
+        args == call(253)
+        for args in mock_marstek_api.set_es_mode_passive.call_args_list
+    )
+    retry_source = origin if origin.endswith("_retry") else f"{origin}_retry"
+    assert f"source={retry_source} " in outgoing_messages(caplog)[-1]
+
+    # A callback from an earlier failure cannot disturb the successful command.
+    calls = mock_marstek_api.set_es_mode_passive.call_count
+    keepalive = command_timers.current
+    await first_retry.fire()
+    assert command_timers.current is keepalive
+    assert mock_marstek_api.set_es_mode_passive.call_count == calls
+    assert not await verify_mismatch(coordinator)  # Still settling.
+    clock.advance(PASSIVE_SETTLE_SECONDS + 1)
+    await coordinator._async_verify_passive_power(
+        {"mode": "Passive", "ongrid_power": 240},
+        es_data={"ongrid_power": 240},
+        fresh=frozenset({"es", "es_mode"}),
+    )
+    assert coordinator.passive_power_state == "acknowledged"
+    await keepalive.fire()
+    assert mock_marstek_api.set_es_mode_passive.call_count == calls + 1
+    assert command_timers.current.delay == PASSIVE_POWER_KEEPALIVE_SECONDS
+
+    for event in (
+        "retry scheduled",
+        "stale retry discarded",
+        "verification suppressed because recovery is pending",
+        "keepalive suppressed because recovery is pending",
+    ):
+        records = [record for record in caplog.records if event in record.getMessage()]
+        assert records
+        for record in records:
+            assert record.levelno == logging.DEBUG
+            assert "sequence=" in record.getMessage()
+            assert "desired_w=240 command_w=253" in record.getMessage()
+            assert f"original_source={origin}" in record.getMessage()
+
+
+@pytest.mark.parametrize("success", [True, False])
+@pytest.mark.parametrize("origin", ["new_target", "keepalive", "retry"])
+async def test_verification_and_keepalive_return_while_command_in_flight(
+    hass, coordinator, command_timers, mock_marstek_api, clock, success, origin
+):
+    """Competing producers must exit without waiting to send after the lock."""
+    if origin != "new_target":
+        mock_marstek_api.set_es_mode_passive.return_value = origin == "keepalive"
+        await coordinator.async_set_passive_power(240)
+    started, finish = asyncio.Event(), asyncio.Event()
+
+    async def send(command, *args):
+        assert command == mock_marstek_api.set_es_mode_passive
+        started.set()
+        await finish.wait()
+        return success
+
+    with patch.object(hass, "async_add_executor_job", side_effect=send) as executor:
+        sending = (
+            asyncio.create_task(coordinator.async_set_passive_power(240))
+            if origin == "new_target"
+            else command_timers.current.fire()
+        )
+        await started.wait()
+        try:
+            clock.advance(PASSIVE_SETTLE_SECONDS + 1)
+            assert coordinator._passive_command_in_flight
+            assert not await asyncio.wait_for(verify_mismatch(coordinator), timeout=1)
+            await asyncio.wait_for(
+                coordinator._async_keepalive_passive_power(
+                    coordinator._passive_control_generation, source="keepalive"
+                ),
+                timeout=1,
+            )
+            assert executor.call_count == 1
+            assert not command_timers.active
+        finally:
+            finish.set()
+            await sending
+    assert not coordinator._passive_command_in_flight
+    assert (coordinator._passive_retry is None) is success
+    assert command_timers.current.delay == (180 if success else 15)
+
+
+@pytest.mark.parametrize("new_power", [240, 300])
+async def test_new_target_invalidates_retry_already_queued_ahead_of_it(
+    coordinator, command_timers, mock_marstek_api, caplog, new_power
+):
+    """Even the same target is a new command; a queued old retry must exit."""
+    mock_marstek_api.set_es_mode_passive.return_value = False
+    await coordinator.async_set_passive_power(240)
+    timer = command_timers.current
+    mock_marstek_api.set_es_mode_passive.return_value = True
+    await coordinator._passive_command_lock.acquire()
+    try:
+        queued = timer.fire()
+        await asyncio.sleep(0)
+        new_target = asyncio.create_task(coordinator.async_set_passive_power(new_power))
+        await asyncio.sleep(0)
+        assert coordinator._passive_retry is None
+    finally:
+        coordinator._passive_command_lock.release()
+    await asyncio.gather(queued, new_target)
+    assert mock_marstek_api.set_es_mode_passive.call_args_list == [
+        call(240),
+        call(new_power),
+    ]
+    assert command_timers.current.delay == PASSIVE_POWER_KEEPALIVE_SECONDS
+    assert "retry cancelled:" in caplog.text
+    assert "stale retry discarded:" in caplog.text
+    assert (
+        "sequence=1 desired_w=240 command_w=240 original_source=new_target"
+        in caplog.text
+    )
+
+
+@pytest.mark.parametrize("success", [True, False])
+async def test_new_targets_supersede_in_flight_command_without_old_recovery(
+    hass, coordinator, command_timers, mock_marstek_api, success
+):
+    """A completing old send cannot schedule recovery over a waiting target."""
+    started, finish = asyncio.Event(), asyncio.Event()
+    sent = []
+
+    async def send(command, power):
+        assert command == mock_marstek_api.set_es_mode_passive
+        sent.append(power)
+        if len(sent) == 1:
+            started.set()
+            await finish.wait()
+            return success
+        return True
+
+    with patch.object(hass, "async_add_executor_job", side_effect=send):
+        old_target = asyncio.create_task(coordinator.async_set_passive_power(240))
+        await started.wait()
+        try:
+            intermediate = asyncio.create_task(coordinator.async_set_passive_power(300))
+            newest = asyncio.create_task(coordinator.async_set_passive_power(400))
+            await asyncio.sleep(0)
+        finally:
+            finish.set()
+            await asyncio.gather(old_target, intermediate, newest)
+    assert sent == [240, 400]
+    assert len(command_timers.history) == 1
+    assert command_timers.current.delay == PASSIVE_POWER_KEEPALIVE_SECONDS
+    assert coordinator.desired_power == 400
+    assert coordinator._passive_retry is None
+
+
+@pytest.mark.parametrize("verification_first", [True, False])
+async def test_queued_verification_cannot_send_a_superseded_target(
+    coordinator, mock_marstek_api, clock, verification_first
+):
+    await coordinator.async_set_passive_power(240)
+    clock.advance(PASSIVE_SETTLE_SECONDS + 1)
+    await coordinator._passive_command_lock.acquire()
+    try:
+        actions = [
+            verify_mismatch(coordinator),
+            coordinator.async_set_passive_power(300),
+        ]
+        if not verification_first:
+            actions.reverse()
+        first = asyncio.create_task(actions[0])
+        await asyncio.sleep(0)
+        second = asyncio.create_task(actions[1])
+        await asyncio.sleep(0)
+    finally:
+        coordinator._passive_command_lock.release()
+    await asyncio.gather(first, second)
+    assert mock_marstek_api.set_es_mode_passive.call_args_list == [call(240), call(300)]
+    assert coordinator.desired_power == 300
+
+
+async def test_slow_successful_retry_gets_full_settle_period_before_learning(
+    hass, coordinator, command_timers, mock_marstek_api, clock
+):
+    mock_marstek_api.set_es_mode_passive.return_value = False
+    await coordinator.async_set_passive_power(240)
+
+    async def slow_send(command, power):
+        assert command == mock_marstek_api.set_es_mode_passive
+        assert power == 240
+        clock.advance(PASSIVE_SETTLE_SECONDS + 1)
+        return True
+
+    with patch.object(hass, "async_add_executor_job", side_effect=slow_send):
+        await command_timers.current.fire()
+    # These stable readings would teach compensation if the request's duration
+    # incorrectly counted as settling time. They are within confirmation tolerance.
+    for _ in range(PASSIVE_STABILITY_SAMPLES):
+        await coordinator._async_verify_passive_power(
+            {"mode": "Passive", "ongrid_power": 205},
+            es_data={"ongrid_power": 205},
+            battery_data={"soc": 50},
+            fresh=frozenset({"es", "es_mode", "battery"}),
+        )
+    assert coordinator.calibration.is_empty
+    mock_marstek_api.set_es_mode_passive.assert_called_once_with(240)
+    mock_marstek_api.set_es_mode_passive.return_value = True
+    await _settle_and_sample(coordinator, clock, actual=205, count=1)
+    assert not coordinator.calibration.is_empty
+    assert coordinator.command_power == 275

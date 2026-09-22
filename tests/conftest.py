@@ -12,6 +12,31 @@ pytest_plugins = ("pytest_homeassistant_custom_component",)
 
 
 @pytest.fixture
+def pv_status():
+    """A PV.GetStatus result with four inputs, including a standby input."""
+    return {
+        "id": 0,
+        "pv1_power": 120,
+        "pv1_voltage": 30,
+        "pv1_current": 4,
+        "pv1_state": 1,
+        "pv2_power": 175,
+        "pv2_voltage": 35,
+        "pv2_current": 5,
+        "pv2_state": 1,
+        "pv3_power": 82.5,
+        "pv3_voltage": 33,
+        "pv3_current": 2.5,
+        "pv3_state": 1,
+        "pv4_power": 0,
+        "pv4_voltage": 10,
+        "pv4_current": 0,
+        "pv4_state": 0,
+        "total_pv_energy": 12500,
+    }
+
+
+@pytest.fixture
 def marstek_entry():
     """An existing config entry, with the original API spelling of its MAC."""
     return MockConfigEntry(

@@ -33,6 +33,13 @@ from .entity import MarstekEntity
 _LOGGER = logging.getLogger(__name__)
 
 
+def _total_pv_power(data: dict) -> StateType:
+    """Derive power from available PV inputs; no readings is not zero power."""
+    powers = [data.get(f"pv{channel}_power") for channel in range(1, 5)]
+    available_powers = [power for power in powers if power is not None]
+    return sum(available_powers) if available_powers else None
+
+
 @dataclass
 class MarstekSensorEntityDescription(SensorEntityDescription):
     """Describes Marstek sensor entity."""
@@ -89,27 +96,50 @@ SENSOR_TYPES: tuple[MarstekSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
         data_key="pv",
-        value_fn=lambda data: data.get("pv_power"),
+        value_fn=_total_pv_power,
         supported_fn=lambda capabilities: capabilities.supports_pv,
     ),
-    MarstekSensorEntityDescription(
-        key="pv_voltage",
-        name="Solar Voltage",
-        native_unit_of_measurement=UnitOfElectricPotential.VOLT,
-        device_class=SensorDeviceClass.VOLTAGE,
-        state_class=SensorStateClass.MEASUREMENT,
-        data_key="pv",
-        value_fn=lambda data: data.get("pv_voltage"),
-        supported_fn=lambda capabilities: capabilities.supports_pv,
+    *(
+        MarstekSensorEntityDescription(
+            key=f"pv{channel}_{measurement}",
+            name=f"PV{channel} {measurement.title()}",
+            native_unit_of_measurement=unit,
+            device_class=device_class,
+            state_class=SensorStateClass.MEASUREMENT,
+            data_key="pv",
+            value_fn=lambda data, key=f"pv{channel}_{measurement}": data.get(key),
+            supported_fn=lambda capabilities: capabilities.supports_pv,
+        )
+        for channel in range(1, 5)
+        for measurement, unit, device_class in (
+            ("power", UnitOfPower.WATT, SensorDeviceClass.POWER),
+            ("voltage", UnitOfElectricPotential.VOLT, SensorDeviceClass.VOLTAGE),
+            ("current", UnitOfElectricCurrent.AMPERE, SensorDeviceClass.CURRENT),
+        )
+    ),
+    *(
+        MarstekSensorEntityDescription(
+            key=f"pv{channel}_state",
+            name=f"PV{channel} State",
+            device_class=SensorDeviceClass.ENUM,
+            options=["standby", "working"],
+            data_key="pv",
+            value_fn=lambda data, key=f"pv{channel}_state": {
+                0: "standby",
+                1: "working",
+            }.get(data.get(key)),
+            supported_fn=lambda capabilities: capabilities.supports_pv,
+        )
+        for channel in range(1, 5)
     ),
     MarstekSensorEntityDescription(
-        key="pv_current",
-        name="Solar Current",
-        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
-        device_class=SensorDeviceClass.CURRENT,
-        state_class=SensorStateClass.MEASUREMENT,
+        key="pv_total_pv_energy",
+        name="PV Total Solar Energy",
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
         data_key="pv",
-        value_fn=lambda data: data.get("pv_current"),
+        value_fn=lambda data: data.get("total_pv_energy"),
         supported_fn=lambda capabilities: capabilities.supports_pv,
     ),
     # Energy System sensors
@@ -271,12 +301,18 @@ class MarstekSensor(MarstekEntity, SensorEntity):
     def available(self) -> bool:
         """Return whether the entity is available."""
         key = self.entity_description.data_key
-        return (
+        section_available = (
             super().available
             and key is not None
             and key in self.coordinator.data
             and self.coordinator.data[key] is not None
         )
+        if section_available and key == "pv":
+            # A successful PV response may omit individual inputs or readings.
+            return (
+                self.entity_description.value_fn(self.coordinator.data[key]) is not None
+            )
+        return section_available
 
     @property
     def native_value(self) -> StateType:

@@ -97,11 +97,13 @@ the authority for gating PV in the capability table.
 example in the same section returns a different shape**: four numbered strings,
 `pv1_power` / `pv1_voltage` / `pv1_current` / `pv1_state` through `pv4_*`.
 
-The integration parses the unnumbered singular form. A device answering with
-the numbered form will produce empty solar sensors. This is a known limitation
-and was deliberately left unfixed; correcting it means deciding whether to sum
-the strings or expose them separately, which is a data-model change rather than
-a capability change.
+The integration uses the numbered fields for individual power (W), voltage (V),
+current (A) and state sensors. State 0 is `standby`, and 1 is `working`.
+Solar Power is derived by summing available `pv1_power` through `pv4_power`;
+no unnumbered PV API fields are consumed. Missing or null readings, including
+an aggregate with no available channel powers, are unavailable rather than zero.
+A separate PV total energy sensor reads `total_pv_energy` when reported. The
+existing ES energy sensor and its units are unchanged.
 
 ### 3.6 ES (Energy System)
 

@@ -73,7 +73,7 @@ async def test_optional_failure_discards_last_good_reading(
     [
         ("ble", {}),
         ("pv", {}),
-        ("pv", {"pv_power": 0}),
+        ("pv", {"pv1_power": 0}),
         ("ble", {"state": "disconnect"}),
     ],
 )
@@ -139,7 +139,7 @@ async def test_reload_reprobes_sections_and_restores_entity_availability(
 ):
     """Real entry reload replaces the flags and restores existing PV/BLE entities."""
     marstek_entry.add_to_hass(hass)
-    mock_marstek_api.get_pv_status.return_value = {"pv_power": 0}
+    mock_marstek_api.get_pv_status.return_value = {"pv1_power": 0}
     mock_marstek_api.get_ble_status.return_value = {"state": "disconnect"}
     assert await hass.config_entries.async_setup(marstek_entry.entry_id)
     await hass.async_block_till_done()
@@ -162,7 +162,7 @@ async def test_reload_reprobes_sections_and_restores_entity_availability(
     assert hass.states.get(pv_id).state == "unavailable"
     assert hass.states.get(ble_id).state == "unavailable"
 
-    mock_marstek_api.get_pv_status.return_value = {"pv_power": 0}
+    mock_marstek_api.get_pv_status.return_value = {"pv1_power": 0}
     mock_marstek_api.get_ble_status.return_value = {"state": "disconnect"}
     await coordinator.async_refresh()
     for method in OPTIONAL.values():

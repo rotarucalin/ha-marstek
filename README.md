@@ -123,9 +123,16 @@ The integration creates the following entities:
 - `sensor.marstek_battery_rated_capacity` - Maximum battery capacity (Wh)
 
 **Solar (Venus A and Venus D only)**
-- `sensor.marstek_solar_power` - Current solar generation (W)
-- `sensor.marstek_solar_voltage` - Solar panel voltage (V)
-- `sensor.marstek_solar_current` - Solar panel current (A)
+- `sensor.marstek_solar_power` - Derived sum of available PV1-PV4 power readings (W)
+- `sensor.marstek_pv1_power` through `sensor.marstek_pv4_power` - Per-input power (W)
+- `sensor.marstek_pv1_voltage` through `sensor.marstek_pv4_voltage` - Per-input voltage (V)
+- `sensor.marstek_pv1_current` through `sensor.marstek_pv4_current` - Per-input current (A)
+- `sensor.marstek_pv1_state` through `sensor.marstek_pv4_state` - Per-input state (`standby` or `working`)
+- `sensor.marstek_pv_total_solar_energy` - Separate `PV.GetStatus` energy total (Wh), when reported
+
+Missing or null PV readings are unavailable. Solar Power sums only reported
+channel powers and is unavailable when none are reported; an actual zero remains
+zero. The old generic Solar Voltage and Solar Current mappings are removed.
 
 **Energy System**
 - `sensor.marstek_battery_power` - Battery charge/discharge power (W)

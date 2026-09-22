@@ -254,10 +254,10 @@ async def test_pv_models_are_polled_for_pv(coordinator, mock_marstek_api, report
         "device": reported,
         "ble_mac": "AA:BB:CC:DD:EE:01",
     }
-    mock_marstek_api.get_pv_status.return_value = {"pv_power": 120}
+    mock_marstek_api.get_pv_status.return_value = {"pv1_power": 120}
     for cycle in range(3):
         data = await coordinator._async_update_data()
-        assert data["pv"] == {"pv_power": 120}
+        assert data["pv"] == {"pv1_power": 120}
         assert mock_marstek_api.get_pv_status.call_count == cycle + 1
     assert coordinator.capabilities.supports_pv
 
@@ -272,7 +272,7 @@ async def test_non_pv_models_are_never_polled_for_pv(
         "device": reported,
         "ble_mac": "AA:BB:CC:DD:EE:01",
     }
-    mock_marstek_api.get_pv_status.return_value = {"pv_power": 120}
+    mock_marstek_api.get_pv_status.return_value = {"pv1_power": 120}
     for _ in range(3):
         data = await coordinator._async_update_data()
         assert "pv" not in data
@@ -288,15 +288,23 @@ async def test_unknown_model_still_probes_pv(coordinator, mock_marstek_api):
         "device": "Venus Z",
         "ble_mac": "AA:BB:CC:DD:EE:01",
     }
-    mock_marstek_api.get_pv_status.return_value = {"pv_power": 55}
-    assert (await coordinator._async_update_data())["pv"] == {"pv_power": 55}
+    mock_marstek_api.get_pv_status.return_value = {"pv1_power": 55}
+    assert (await coordinator._async_update_data())["pv"] == {"pv1_power": 55}
 
 
 # --------------------------------------------------------------------------
 # Entity creation follows the capability profile
 # --------------------------------------------------------------------------
 
-PV_ENTITY_KEYS = ["pv_power", "pv_voltage", "pv_current"]
+PV_ENTITY_KEYS = [
+    "pv_power",
+    "pv_total_pv_energy",
+    *(
+        f"pv{channel}_{field}"
+        for channel in range(1, 5)
+        for field in ("power", "voltage", "current", "state")
+    ),
+]
 
 
 async def _setup_model(hass, entry, api, reported):
@@ -316,13 +324,9 @@ async def _setup_model(hass, entry, api, reported):
 @pytest.mark.usefixtures("enable_custom_integrations")
 @pytest.mark.parametrize("reported", PV_MODELS)
 async def test_pv_entities_exist_for_pv_models(
-    hass, marstek_entry, mock_marstek_api, reported
+    hass, marstek_entry, mock_marstek_api, reported, pv_status
 ):
-    mock_marstek_api.get_pv_status.return_value = {
-        "pv_power": 120,
-        "pv_voltage": 30,
-        "pv_current": 4,
-    }
+    mock_marstek_api.get_pv_status.return_value = pv_status
     await _setup_model(hass, marstek_entry, mock_marstek_api, reported)
     registry = er.async_get(hass)
     for key in PV_ENTITY_KEYS:
@@ -330,7 +334,7 @@ async def test_pv_entities_exist_for_pv_models(
             "sensor", DOMAIN, f"{marstek_entry.unique_id}_{key}"
         )
         assert entity_id is not None, key
-        assert hass.states.get(entity_id).state not in (None, "unavailable")
+        assert hass.states.get(entity_id).state not in (None, "unknown", "unavailable")
 
 
 @pytest.mark.asyncio

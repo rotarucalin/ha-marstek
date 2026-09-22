@@ -210,20 +210,29 @@ class MarstekAPI:
         week_set: int,
         power: int,
         enable: int = 1,
+        manual_set: int | None = None,
     ) -> bool:
-        """Set energy system to Manual mode."""
+        """Set energy system to Manual mode.
+
+        `manual_set` is only accepted by the Venus E mini, so it is omitted
+        unless the caller's capability profile declares support for it.
+        """
+        manual_cfg = {
+            "time_num": time_num,
+            "start_time": start_time,
+            "end_time": end_time,
+            "week_set": week_set,
+            "power": power,
+            "enable": enable,
+        }
+        if manual_set is not None:
+            manual_cfg["manual_set"] = manual_set
+
         params = {
             "id": 0,
             "config": {
                 "mode": "Manual",
-                "manual_cfg": {
-                    "time_num": time_num,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "week_set": week_set,
-                    "power": power,
-                    "enable": enable,
-                },
+                "manual_cfg": manual_cfg,
             },
         }
         result = self._send_request("ES.SetMode", params)

@@ -8,7 +8,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import MarstekDataUpdateCoordinator
-from .const import DOMAIN, OPERATING_MODES
+from .const import DOMAIN
 from .entity import MarstekEntity
 
 
@@ -29,7 +29,9 @@ class MarstekOperatingModeSelect(MarstekEntity, SelectEntity):
         """Initialize the select entity."""
         super().__init__(coordinator, "operating_mode")
         self._attr_name = "Operating Mode"
-        self._attr_options = OPERATING_MODES
+        # Offer only the modes this model accepts, rather than every mode the
+        # integration knows how to send.
+        self._attr_options = list(coordinator.capabilities.es_modes)
 
     @property
     def current_option(self) -> str | None:

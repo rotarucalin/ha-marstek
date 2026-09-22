@@ -2,7 +2,7 @@
 
 ## Overview
 
-This is a complete, production-ready Home Assistant custom integration for Marstek battery systems (Venus C, Venus E, and Venus D models). The integration provides full local control over your Marstek device using the UDP-based Open API.
+This is a complete, production-ready Home Assistant custom integration for Marstek battery systems (Venus A, Venus C, Venus D, Venus E and Venus E mini models). The integration provides full local control over your Marstek device using the UDP-based Open API.
 
 ## Package Contents
 
@@ -57,8 +57,16 @@ This is a complete, production-ready Home Assistant custom integration for Marst
 ### Venus C/E
 Components: Marstek, WiFi, Bluetooth, Battery, ES, EM
 
-### Venus D  
+### Venus A/D
 Components: Marstek, WiFi, Bluetooth, Battery, PV, ES, EM
+
+### Venus E mini
+Components: Marstek, WiFi, Bluetooth, Battery, ES, EM
+Manual mode: time periods 0-5 only, and `manual_cfg` carries `manual_set`.
+
+Capabilities live in one table in `capabilities.py`, keyed by the model the
+device reports. An unlisted model still sets up on the full documented API and
+logs its name once.
 
 ## Entity Summary
 
@@ -69,7 +77,7 @@ Components: Marstek, WiFi, Bluetooth, Battery, PV, ES, EM
 - Battery Capacity (Wh)
 - Battery Rated Capacity (Wh)
 
-**Solar - Venus D only (3):**
+**Solar - Venus A and Venus D only (3):**
 - Solar Power (W)
 - Solar Voltage (V)
 - Solar Current (A)
@@ -286,7 +294,7 @@ marstek_integration/
 **Home Assistant:** 2023.1.0 or higher (recommended)
 **Python:** 3.11+ (via Home Assistant)
 **Network:** IPv4 local network required
-**Devices:** Venus C, Venus E, Venus D
+**Devices:** Venus A, Venus C, Venus D, Venus E, Venus E mini
 
 ## Support and Contributing
 

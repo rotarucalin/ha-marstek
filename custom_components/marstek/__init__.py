@@ -19,12 +19,15 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .capabilities import MarstekCapabilities, resolve_capabilities
 from .const import (
     CALIBRATION_STORAGE_KEY_FMT,
     CALIBRATION_STORAGE_VERSION,
     CONF_MAX_PASSIVE_POWER,
     DEFAULT_MAX_PASSIVE_POWER,
     DOMAIN,
+    MANUAL_DEFAULT_SLOT,
+    MANUAL_SET_AUTO,
     MODE_AI,
     MODE_AUTO,
     MODE_MANUAL,
@@ -185,6 +188,9 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                         self.device_info.setdefault("device", device.model)
                     if device.sw_version:
                         self.device_info.setdefault("ver", device.sw_version)
+        # Resolved from cached metadata so entity platforms can gate on it
+        # during the first setup, then refreshed once the device answers.
+        self._capabilities = resolve_capabilities(self.device_info.get("device"))
         self._last_good_data: dict = {}
         self._missing_cycles: dict[str, int] = {}
         self._next_wifi_poll_at = 0.0
@@ -231,6 +237,15 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         )
 
     @property
+    def capabilities(self) -> MarstekCapabilities:
+        """Return what the connected model supports.
+
+        Platforms and command paths consult this instead of testing the
+        reported model name, so a new model only needs a table entry.
+        """
+        return self._capabilities
+
+    @property
     def registry_device_info(self) -> dr.DeviceInfo:
         """Describe this battery without deriving its identity from polling data."""
         if self.device_id is None:
@@ -275,6 +290,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 self.device_id = reported_id
             self.device_info.update(device_metadata(info))
             self.device_info["ble_mac"] = self.device_id
+            self._capabilities = resolve_capabilities(self.device_info.get("device"))
             self._device_info_fetched = bool(self.device_info.get("device"))
             self._identity_mismatch = False
             if (
@@ -399,6 +415,16 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                     mode,
                 )
                 return False
+            if not self.capabilities.supports_mode(mode):
+                _LOGGER.warning(
+                    "Marstek command blocked: device=%s source=%s mode=%s "
+                    "error=%s does not support this mode",
+                    self.entry.title,
+                    source,
+                    mode,
+                    self.capabilities.model,
+                )
+                return False
             if mode == MODE_PASSIVE:
                 return True
 
@@ -430,10 +456,24 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         elif mode == MODE_AI:
             command, args = self.api.set_es_mode_ai, ()
         elif mode == MODE_MANUAL and power is not None:
-            command, args = (
-                self.api.set_es_mode_manual,
-                (0, "00:00", "23:59", 127, power, 1),
-            )
+            if not self.capabilities.is_valid_manual_slot(MANUAL_DEFAULT_SLOT):
+                _LOGGER.warning(
+                    "Marstek command blocked: device=%s source=%s mode=%s "
+                    "error=%s has no Manual slot %s",
+                    self.entry.title,
+                    source,
+                    mode,
+                    self.capabilities.model,
+                    MANUAL_DEFAULT_SLOT,
+                )
+                return False
+            # manual_cfg only accepts manual_set on the Venus E mini, where it
+            # selects the slot's direction; other models reject the field, so
+            # their command stays exactly as it was before capabilities existed.
+            args = (MANUAL_DEFAULT_SLOT, "00:00", "23:59", 127, power, 1)
+            if self.capabilities.supports_manual_set:
+                args += (MANUAL_SET_AUTO,)
+            command = self.api.set_es_mode_manual
         else:
             return False
 
@@ -446,8 +486,11 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             context += f" power={power}W"
         if mode == MODE_MANUAL:
             context += (
-                " time_num=0 start_time=00:00 end_time=23:59 week_set=127 enable=1"
+                f" time_num={MANUAL_DEFAULT_SLOT} start_time=00:00 end_time=23:59 "
+                "week_set=127 enable=1"
             )
+            if self.capabilities.supports_manual_set:
+                context += f" manual_set={MANUAL_SET_AUTO}"
         if source != "keepalive":
             _LOGGER.debug("Marstek command: %s", context)
         error = "API returned failure (request failed or set_result missing/false)"
@@ -1129,9 +1172,12 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             if bat_status is not None:
                 data["battery"] = bat_status
 
-            pv_status = await self._fetch_section("pv", self.api.get_pv_status)
-            if pv_status is not None:
-                data["pv"] = pv_status
+            # Only Venus A/D answer PV.GetStatus; the rest would time out here
+            # every cycle until the optional-section probe gave up.
+            if self.capabilities.supports_pv:
+                pv_status = await self._fetch_section("pv", self.api.get_pv_status)
+                if pv_status is not None:
+                    data["pv"] = pv_status
 
             es_status = await self._fetch_section("es", self.api.get_es_status)
             if es_status is not None:

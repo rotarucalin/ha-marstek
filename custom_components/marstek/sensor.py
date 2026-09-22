@@ -26,6 +26,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 
 from . import MarstekDataUpdateCoordinator
+from .capabilities import MarstekCapabilities
 from .const import DOMAIN, PASSIVE_POWER_STATES
 from .entity import MarstekEntity
 
@@ -38,6 +39,8 @@ class MarstekSensorEntityDescription(SensorEntityDescription):
 
     value_fn: Callable[[dict], StateType] | None = None
     data_key: str | None = None
+    supported_fn: Callable[[MarstekCapabilities], bool] | None = None
+    """Create this sensor only for models whose capabilities allow it."""
 
 
 SENSOR_TYPES: tuple[MarstekSensorEntityDescription, ...] = (
@@ -78,7 +81,7 @@ SENSOR_TYPES: tuple[MarstekSensorEntityDescription, ...] = (
         data_key="battery",
         value_fn=lambda data: data.get("rated_capacity"),
     ),
-    # PV sensors
+    # PV sensors, created only for models that answer PV.GetStatus.
     MarstekSensorEntityDescription(
         key="pv_power",
         name="Solar Power",
@@ -87,6 +90,7 @@ SENSOR_TYPES: tuple[MarstekSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         data_key="pv",
         value_fn=lambda data: data.get("pv_power"),
+        supported_fn=lambda capabilities: capabilities.supports_pv,
     ),
     MarstekSensorEntityDescription(
         key="pv_voltage",
@@ -96,6 +100,7 @@ SENSOR_TYPES: tuple[MarstekSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         data_key="pv",
         value_fn=lambda data: data.get("pv_voltage"),
+        supported_fn=lambda capabilities: capabilities.supports_pv,
     ),
     MarstekSensorEntityDescription(
         key="pv_current",
@@ -105,6 +110,7 @@ SENSOR_TYPES: tuple[MarstekSensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         data_key="pv",
         value_fn=lambda data: data.get("pv_current"),
+        supported_fn=lambda capabilities: capabilities.supports_pv,
     ),
     # Energy System sensors
     MarstekSensorEntityDescription(
@@ -234,8 +240,13 @@ async def async_setup_entry(
     """Set up Marstek sensors based on a config entry."""
     coordinator: MarstekDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
 
+    capabilities = coordinator.capabilities
     entities = []
     for description in SENSOR_TYPES:
+        if description.supported_fn is not None and not description.supported_fn(
+            capabilities
+        ):
+            continue
         entities.append(MarstekSensor(coordinator, description))
     entities.append(MarstekPassivePowerStateSensor(coordinator))
 

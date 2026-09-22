@@ -16,7 +16,7 @@ This guide walks you through the complete installation and setup process for the
 Before you begin, ensure you have:
 
 - ✅ Home Assistant installed and running (minimum version 2023.1.0 or higher recommended)
-- ✅ Marstek battery system (Venus C, E, or D)
+- ✅ Marstek battery system (Venus A, C, D, E, or E mini)
 - ✅ Device connected to your local network via WiFi or Ethernet
 - ✅ Marstek mobile app installed on your phone
 - ✅ Access to your Home Assistant configuration files (for manual installation)
@@ -226,7 +226,7 @@ Check logs: Settings → System → Logs
      - sensor.marstek_battery_state_of_charge
      - sensor.marstek_battery_power
      - sensor.marstek_grid_power
-     - sensor.marstek_solar_power  # Venus D only
+     - sensor.marstek_solar_power  # Venus A and Venus D only
      - select.marstek_operating_mode
    ```
 

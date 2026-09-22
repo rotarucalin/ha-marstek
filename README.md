@@ -1,6 +1,6 @@
 # Marstek Battery System Integration for Home Assistant
 
-A custom Home Assistant integration for Marstek battery systems (Venus C, Venus E, Venus D) using the local UDP API.
+A custom Home Assistant integration for Marstek battery systems (Venus A, Venus C, Venus D, Venus E, Venus E mini) using the local UDP API.
 
 ## Device identity and multiple batteries
 
@@ -31,8 +31,31 @@ duplicate. Migration only handles records owned by the relevant config entry.
 
 ## Supported Devices
 
-- **Venus C/E**: Battery systems with WiFi, Bluetooth, Battery, ES, and EM components
-- **Venus D**: Battery systems with additional PV (photovoltaic) support
+Every model in chapter 4 of the Marstek Device Open API is supported. They all
+expose WiFi, Bluetooth, Battery, Energy System and Energy Meter components, and
+all four operating modes. The differences the integration acts on are below.
+
+| Model | Solar (PV) sensors | Manual time periods | Notes |
+| --- | --- | --- | --- |
+| Venus A | Yes | 0-9 | |
+| Venus C | No | 0-9 | |
+| Venus D | Yes | 0-9 | |
+| Venus E | No | 0-9 | |
+| Venus E mini | No | 0-5 | Manual commands also carry `manual_set` |
+
+The integration reads the model from the device and looks it up in a capability
+table, tolerating firmware spelling differences such as `VenusC`, `Venus C` and
+`VNSEM-0`. Solar sensors and PV polling exist only for models that answer the PV
+API, so a Venus C or Venus E no longer carries three permanently unavailable
+solar entities.
+
+A model that is not in the table still sets up. It falls back to the full
+documented API and logs its reported name once, so please open an issue with
+that log line and the model can be added.
+
+The protocol itself is summarised in
+[docs/MARSTEK_OPEN_API.md](docs/MARSTEK_OPEN_API.md), including which fields
+each model exposes and where the official document contradicts itself.
 
 ## Requirements
 
@@ -99,7 +122,7 @@ The integration creates the following entities:
 - `sensor.marstek_battery_capacity` - Current battery capacity (Wh)
 - `sensor.marstek_battery_rated_capacity` - Maximum battery capacity (Wh)
 
-**Solar (Venus D only)**
+**Solar (Venus A and Venus D only)**
 - `sensor.marstek_solar_power` - Current solar generation (W)
 - `sensor.marstek_solar_voltage` - Solar panel voltage (V)
 - `sensor.marstek_solar_current` - Solar panel current (A)
@@ -210,7 +233,7 @@ Set detailed manual mode schedule (advanced users).
 service: marstek.set_operating_mode_manual
 data:
   entity_id: select.marstek_operating_mode
-  time_num: 0  # Time period (0-9)
+  time_num: 0  # Time period (0-9; the Venus E mini has only 0-5)
   start_time: "08:00"
   end_time: "20:00"
   week_set: 127  # Bitmask: 1=Mon, 3=Mon+Tue, 127=All week
@@ -295,7 +318,7 @@ You can add the Marstek sensors to Home Assistant's Energy Dashboard:
 1. Go to **Settings** → **Dashboards** → **Energy**
 2. Add **Grid consumption**: `sensor.marstek_total_grid_input_energy`
 3. Add **Return to grid**: `sensor.marstek_total_grid_output_energy`
-4. Add **Solar production**: `sensor.marstek_total_solar_energy` (Venus D)
+4. Add **Solar production**: `sensor.marstek_total_solar_energy` (Venus A and Venus D)
 5. Add **Battery systems**: 
    - Energy going in: Set up a template sensor based on positive `sensor.marstek_battery_power`
    - Energy going out: Set up a template sensor based on negative `sensor.marstek_battery_power`

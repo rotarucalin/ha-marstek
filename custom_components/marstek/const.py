@@ -11,18 +11,37 @@ CONF_MAX_PASSIVE_POWER = "max_passive_power"
 DEFAULT_PORT = 30000
 DEFAULT_NAME = "Marstek Battery System"
 
-# Device models
-DEVICE_VENUS_C = "VenusC"
-DEVICE_VENUS_E = "VenusE"
-DEVICE_VENUS_D = "VenusD"
+# Device models, as named in chapter 4 of the Marstek Device Open API (Rev 3.1).
+# Firmware reports these with varying spelling ("VenusC", "Venus C", and the
+# "VenusC-123456789012" form used by `src`), so never compare against them
+# directly; resolve capabilities through .capabilities instead.
+DEVICE_VENUS_A = "Venus A"
+DEVICE_VENUS_C = "Venus C"
+DEVICE_VENUS_D = "Venus D"
+DEVICE_VENUS_E = "Venus E"
+DEVICE_VENUS_E_MINI = "Venus E mini"
 
 # Operating modes
 MODE_AUTO = "Auto"
 MODE_AI = "AI"
 MODE_MANUAL = "Manual"
 MODE_PASSIVE = "Passive"
+# The API also documents "Ups". It is deliberately not offered yet.
+# The list of modes the integration exposes lives in capabilities.ALL_ES_MODES,
+# so a model's supported modes have exactly one source of truth.
 
-OPERATING_MODES = [MODE_AUTO, MODE_AI, MODE_MANUAL, MODE_PASSIVE]
+# Manual mode addresses one schedule slot per command through `time_num`.
+# Venus A/C/D/E support 0-9; Venus E mini supports 0-5.
+MANUAL_SLOTS_DEFAULT = 10
+MANUAL_SLOTS_E_MINI = 6
+# Selecting Manual from the mode select entity writes this single slot.
+MANUAL_DEFAULT_SLOT = 0
+
+# `manual_set` is an extra manual_cfg field accepted only by the Venus E mini.
+MANUAL_SET_DISABLE = 0
+MANUAL_SET_CHARGE = 1
+MANUAL_SET_DISCHARGE = 2
+MANUAL_SET_AUTO = 3
 
 # Passive power control states
 PASSIVE_STATE_UNKNOWN = "unknown"

@@ -76,10 +76,12 @@ class MarstekAPI:
         }
 
         try:
+            # Pin sending and validation to the same IPv4 address for this request.
+            resolved_ip = socket.gethostbyname(self.host)
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                 sock.settimeout(self.timeout)
                 message = json.dumps(request).encode("utf-8")
-                sock.sendto(message, (self.host, self.port))
+                sock.sendto(message, (resolved_ip, self.port))
                 deadline = monotonic() + self.timeout
                 while True:
                     remaining = deadline - monotonic()
@@ -87,7 +89,7 @@ class MarstekAPI:
                         raise TimeoutError
                     sock.settimeout(remaining)
                     data, addr = sock.recvfrom(4096)
-                    if addr[0] != self.host:
+                    if addr[0] != resolved_ip:
                         _LOGGER.debug(
                             "Ignored packet from unexpected sender: sender=%s "
                             "host=%s port=%s method=%s request_id=%s",

@@ -2,6 +2,7 @@
 
 import json
 import logging
+import socket
 from unittest.mock import patch
 
 import pytest
@@ -10,6 +11,45 @@ from custom_components.marstek import MarstekDataUpdateCoordinator
 from custom_components.marstek.marstek_api import MarstekAPI
 
 API_MODULE = "custom_components.marstek.marstek_api"
+
+
+@pytest.mark.parametrize("host", ["192.0.2.1", "venus-a.local"])
+def test_request_validates_resolved_sender(host):
+    """Literal IPv4 addresses and hostnames accept the resolved device's reply."""
+    api = MarstekAPI(host)
+    with (
+        patch(
+            f"{API_MODULE}.socket.gethostbyname", return_value="192.0.2.1"
+        ) as resolve,
+        patch(f"{API_MODULE}.socket.socket") as socket_factory,
+    ):
+        connection = socket_factory.return_value.__enter__.return_value
+        connection.recvfrom.side_effect = [
+            (b'{"id":1,"result":{"soc":50}}', ("192.0.2.1", 30000)),
+            TimeoutError(),
+        ]
+        assert api.get_battery_status() == {"soc": 50}
+        resolve.assert_called_once_with(host)
+        assert connection.sendto.call_args.args[1] == ("192.0.2.1", 30000)
+        assert connection.recvfrom.call_count == 1
+
+
+def test_hostname_resolution_failure(caplog):
+    """A DNS failure returns no result and logs context without sending a request."""
+    api = MarstekAPI("venus-a.local")
+    with (
+        patch(
+            f"{API_MODULE}.socket.gethostbyname",
+            side_effect=socket.gaierror(socket.EAI_NONAME, "Name resolution failed"),
+        ) as resolve,
+        patch(f"{API_MODULE}.socket.socket") as socket_factory,
+    ):
+        assert api.get_battery_status() is None
+        resolve.assert_called_once_with(api.host)
+        socket_factory.assert_not_called()
+    assert "host=venus-a.local port=30000 method=Bat.GetStatus" in caplog.text
+    assert "gaierror" in caplog.text
+    assert "Name resolution failed" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -144,23 +184,30 @@ async def test_real_api_failure_schedules_retry_with_one_warning(
         ),
     ],
 )
+@pytest.mark.parametrize("host", ["192.0.2.1", "venus-a.local"])
 def test_invalid_packet_followed_by_matching_response(
-    caplog, packet, sender, diagnostic
+    caplog, packet, sender, diagnostic, host
 ):
     """An unrelated first packet must not fail or resend the current request."""
-    api = MarstekAPI("192.0.2.1")
+    api = MarstekAPI(host)
     caplog.set_level(logging.DEBUG, logger=API_MODULE)
-    with patch(f"{API_MODULE}.socket.socket") as socket:
+    with (
+        patch(
+            f"{API_MODULE}.socket.gethostbyname", return_value="192.0.2.1"
+        ) as resolve,
+        patch(f"{API_MODULE}.socket.socket") as socket,
+    ):
         connection = socket.return_value.__enter__.return_value
         connection.recvfrom.side_effect = [
             (packet, (sender, 30000)),
-            (b'{"id":1,"result":{"soc":50}}', (api.host, api.port)),
+            (b'{"id":1,"result":{"soc":50}}', ("192.0.2.1", api.port)),
         ]
         assert api.get_battery_status() == {"soc": 50}
         assert connection.recvfrom.call_count == 2
         connection.sendto.assert_called_once()
+        resolve.assert_called_once_with(host)
     assert diagnostic in caplog.text
-    assert "host=192.0.2.1" in caplog.text
+    assert f"host={host}" in caplog.text
     assert "request_id=1" in caplog.text
     assert all(record.levelno == logging.DEBUG for record in caplog.records)
 

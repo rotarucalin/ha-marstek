@@ -59,7 +59,10 @@ def test_gap_starts_after_completion_even_on_failure(transport_clock, reply, idl
         transport_clock.now += 5.0 if isinstance(reply, Exception) else 0.2
         if isinstance(reply, Exception):
             raise reply
-        return reply, (api.host, api.port)
+        packet = reply
+        if reply != b"invalid json":
+            packet = json.dumps({"id": api._request_id, **json.loads(reply)}).encode()
+        return packet, (api.host, api.port)
 
     def close(*_args):
         transport_clock.now += 0.1
@@ -107,7 +110,10 @@ def test_transport_exceptions_leave_a_quiet_gap(transport_clock, failure_at):
 
         socket.side_effect = None
         connection.sendto.side_effect = None
-        connection.recvfrom.return_value = (b'{"result":{}}', (api.host, api.port))
+        connection.recvfrom.return_value = (
+            b'{"id":2,"result":{}}',
+            (api.host, api.port),
+        )
         assert api.get_battery_status() == {}
         assert transport_clock.sleeps == [2.5]
 
@@ -173,7 +179,10 @@ def test_concurrent_calls_share_one_transport_slot(
             if (index == 0 and first_fails) or reply_count > 1:
                 raise TimeoutError
             result = {"set_result": True} if payload["method"] == "ES.SetMode" else {}
-            return json.dumps({"result": result}).encode(), (api.host, api.port)
+            return json.dumps({"id": payload["id"], "result": result}).encode(), (
+                api.host,
+                api.port,
+            )
 
         def close(*_args):
             transport_clock.now += 0.1
@@ -221,7 +230,10 @@ def test_different_clients_do_not_share_a_cooldown(transport_clock):
     """One slow battery must not delay another battery's first request."""
     with patch(f"{API_MODULE}.socket.socket") as socket:
         connection = socket.return_value.__enter__.return_value
-        connection.recvfrom.return_value = (b'{"result":{}}', ("192.0.2.1", 30000))
+        connection.recvfrom.side_effect = [
+            (b'{"id":1,"result":{}}', (host, 30000))
+            for host in ("192.0.2.1", "192.0.2.2")
+        ]
         assert MarstekAPI("192.0.2.1").get_battery_status() == {}
         assert MarstekAPI("192.0.2.2").get_battery_status() == {}
     assert transport_clock.sleeps == []

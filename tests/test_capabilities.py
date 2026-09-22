@@ -442,7 +442,7 @@ def test_api_includes_manual_set_only_when_given(manual_set, expected):
     with patch("custom_components.marstek.marstek_api.socket.socket") as socket:
         connection = socket.return_value.__enter__.return_value
         connection.recvfrom.return_value = (
-            json.dumps({"result": {"set_result": True}}).encode(),
+            json.dumps({"id": 1, "result": {"set_result": True}}).encode(),
             ("192.0.2.1", 30000),
         )
         assert api.set_es_mode_manual(0, "00:00", "23:59", 127, 100, 1, manual_set)

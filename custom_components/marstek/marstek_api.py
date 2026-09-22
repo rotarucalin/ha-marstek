@@ -80,8 +80,62 @@ class MarstekAPI:
                 sock.settimeout(self.timeout)
                 message = json.dumps(request).encode("utf-8")
                 sock.sendto(message, (self.host, self.port))
-                data, _ = sock.recvfrom(4096)
-                response = json.loads(data.decode("utf-8"))
+                deadline = monotonic() + self.timeout
+                while True:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    sock.settimeout(remaining)
+                    data, addr = sock.recvfrom(4096)
+                    if addr[0] != self.host:
+                        _LOGGER.debug(
+                            "Ignored packet from unexpected sender: sender=%s "
+                            "host=%s port=%s method=%s request_id=%s",
+                            addr,
+                            self.host,
+                            self.port,
+                            method,
+                            request["id"],
+                        )
+                        continue
+                    try:
+                        response = json.loads(data.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as err:
+                        _LOGGER.debug(
+                            "Ignored malformed packet: host=%s port=%s method=%s "
+                            "request_id=%s error=%s",
+                            self.host,
+                            self.port,
+                            method,
+                            request["id"],
+                            err,
+                        )
+                        continue
+                    if not isinstance(response, dict):
+                        _LOGGER.debug(
+                            "Ignored malformed packet: host=%s port=%s method=%s "
+                            "request_id=%s expected JSON object",
+                            self.host,
+                            self.port,
+                            method,
+                            request["id"],
+                        )
+                        continue
+                    response_id = response.get("id")
+                    # Requests use integer IDs, which the device must echo.
+                    # Exact type checking also excludes bools and floats.
+                    if type(response_id) is not int or response_id != request["id"]:
+                        _LOGGER.debug(
+                            "Ignored packet with mismatching request ID: "
+                            "host=%s port=%s method=%s request_id=%s response_id=%r",
+                            self.host,
+                            self.port,
+                            method,
+                            request["id"],
+                            response_id,
+                        )
+                        continue
+                    break
 
             if "error" in response:
                 self._log_request_error(
@@ -95,9 +149,6 @@ class MarstekAPI:
 
         except TimeoutError:
             self._log_request_error(method, "Timeout communicating with device")
-            return None
-        except json.JSONDecodeError as err:
-            self._log_request_error(method, f"Failed to decode JSON response: {err}")
             return None
         except Exception as err:  # noqa: BLE001 - Preserve the best-effort API contract.
             self._log_request_error(method, f"{type(err).__name__}: {err}")

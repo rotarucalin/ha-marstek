@@ -298,7 +298,6 @@ async def test_unknown_model_still_probes_pv(coordinator, mock_marstek_api):
 
 PV_ENTITY_KEYS = [
     "pv_power",
-    "pv_total_pv_energy",
     *(
         f"pv{channel}_{field}"
         for channel in range(1, 5)

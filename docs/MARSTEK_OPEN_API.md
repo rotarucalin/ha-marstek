@@ -102,8 +102,8 @@ current (A) and state sensors. State 0 is `standby`, and 1 is `working`.
 Solar Power is derived by summing available `pv1_power` through `pv4_power`;
 no unnumbered PV API fields are consumed. Missing or null readings, including
 an aggregate with no available channel powers, are unavailable rather than zero.
-A separate PV total energy sensor reads `total_pv_energy` when reported. The
-existing ES energy sensor and its units are unchanged.
+`total_pv_energy` is not part of `PV.GetStatus`; it belongs to `ES.GetStatus`
+(3.6) and is exposed only by the existing ES energy sensor, unchanged.
 
 ### 3.6 ES (Energy System)
 

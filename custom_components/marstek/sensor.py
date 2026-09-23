@@ -132,16 +132,6 @@ SENSOR_TYPES: tuple[MarstekSensorEntityDescription, ...] = (
         )
         for channel in range(1, 5)
     ),
-    MarstekSensorEntityDescription(
-        key="pv_total_pv_energy",
-        name="PV Total Solar Energy",
-        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL_INCREASING,
-        data_key="pv",
-        value_fn=lambda data: data.get("total_pv_energy"),
-        supported_fn=lambda capabilities: capabilities.supports_pv,
-    ),
     # Energy System sensors
     MarstekSensorEntityDescription(
         key="es_battery_power",

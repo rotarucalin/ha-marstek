@@ -32,7 +32,6 @@ def pv_status():
         "pv4_voltage": 10,
         "pv4_current": 0,
         "pv4_state": 0,
-        "total_pv_energy": 12500,
     }
 
 

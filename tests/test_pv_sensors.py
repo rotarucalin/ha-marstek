@@ -56,11 +56,6 @@ async def test_four_pv_channels(hass, marstek_entry, mock_marstek_api, pv_status
     assert power.attributes["unit_of_measurement"] == "W"
     assert power.attributes["device_class"] == "power"
     assert power.attributes["state_class"] == "measurement"
-    energy = sensor_state(hass, marstek_entry, "pv_total_pv_energy")
-    assert float(energy.state) == 12500
-    assert energy.attributes["unit_of_measurement"] == "Wh"
-    assert energy.attributes["device_class"] == "energy"
-    assert energy.attributes["state_class"] == "total_increasing"
     # ES.GetStatus has its own energy total; preserve its source and identity.
     assert sensor_state(hass, marstek_entry, "es_total_pv_energy").state == "4321"
     for key in ("pv_voltage", "pv_current"):
@@ -112,7 +107,6 @@ async def test_channel_data_disappears_and_recovers(
         "pv4_voltage",
         "pv4_current",
         "pv4_state",
-        "total_pv_energy",
     ]
     for key in missing_keys:
         if missing == "null":
@@ -123,8 +117,7 @@ async def test_channel_data_disappears_and_recovers(
     await coordinator.async_refresh()
     await hass.async_block_till_done()
     for key in missing_keys:
-        sensor_key = "pv_total_pv_energy" if key == "total_pv_energy" else key
-        assert sensor_state(hass, marstek_entry, sensor_key).state == "unavailable"
+        assert sensor_state(hass, marstek_entry, key).state == "unavailable"
     assert sensor_state(hass, marstek_entry, "pv1_voltage").state == "30"
     assert sensor_state(hass, marstek_entry, "pv2_power").state == "175"
     assert float(sensor_state(hass, marstek_entry, "pv_power").state) == 257.5
@@ -135,7 +128,6 @@ async def test_channel_data_disappears_and_recovers(
     assert sensor_state(hass, marstek_entry, "pv1_power").state == "120"
     assert sensor_state(hass, marstek_entry, "pv4_power").state == "0"
     assert sensor_state(hass, marstek_entry, "pv4_state").state == "standby"
-    assert sensor_state(hass, marstek_entry, "pv_total_pv_energy").state == "12500"
 
 
 @pytest.mark.parametrize(

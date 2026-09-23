@@ -128,7 +128,6 @@ The integration creates the following entities:
 - `sensor.marstek_pv1_voltage` through `sensor.marstek_pv4_voltage` - Per-input voltage (V)
 - `sensor.marstek_pv1_current` through `sensor.marstek_pv4_current` - Per-input current (A)
 - `sensor.marstek_pv1_state` through `sensor.marstek_pv4_state` - Per-input state (`standby` or `working`)
-- `sensor.marstek_pv_total_solar_energy` - Separate `PV.GetStatus` energy total (Wh), when reported
 
 Missing or null PV readings are unavailable. Solar Power sums only reported
 channel powers and is unavailable when none are reported; an actual zero remains

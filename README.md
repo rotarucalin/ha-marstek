@@ -35,13 +35,15 @@ Every model in chapter 4 of the Marstek Device Open API is supported. They all
 expose WiFi, Bluetooth, Battery, Energy System and Energy Meter components, and
 all four operating modes. The differences the integration acts on are below.
 
-| Model | Solar (PV) sensors | Manual time periods | Notes |
-| --- | --- | --- | --- |
-| Venus A | Yes | 0-9 | |
-| Venus C | No | 0-9 | |
-| Venus D | Yes | 0-9 | |
-| Venus E | No | 0-9 | |
-| Venus E mini | No | 0-5 | Manual commands also carry `manual_set` |
+| Model | Solar (PV) sensors | Manual time periods | Passive/Manual power limit | Notes |
+| --- | --- | --- | --- | --- |
+| Venus A | Yes | 0-9 | 1500 W | |
+| Venus C | No | 0-9 | 3000 W (no documented rating) | |
+| Venus D | Yes | 0-9 | 2200 W | |
+| Venus E | No | 0-9 | 2500 W | |
+| Venus E mini | No | 0-5 | 3000 W (no documented rating) | Manual commands also carry `manual_set` |
+
+Power limits are conservative ceilings taken from chapter 4 of the Open API where it documents a rating; a specific unit may be rated lower. Venus C and the Venus E mini have no documented rating and fall back to the same 3000 W ceiling used for an unrecognised model. Your configured **Max Passive Power** option can only tighten this further, never raise it above the model's own limit.
 
 The integration reads the model from the device and looks it up in a capability
 table, tolerating firmware spelling differences such as `VenusC`, `Venus C` and
@@ -174,14 +176,7 @@ The device operates automatically based on built-in algorithms.
 The device uses AI-based optimization for charging and discharging.
 
 ### Manual Mode
-Create custom schedules for charging/discharging. When switching to Manual mode via the select entity, it defaults to:
-- Time period: 0
-- Schedule: 00:00-23:59
-- Days: All week (Monday-Sunday)
-- Power: 100W
-- Enabled
-
-For advanced manual scheduling, use the service calls described below.
+Create custom schedules for charging/discharging, one schedule slot (`time_num`) at a time. There is no default schedule: the API has no way to change mode to Manual without also naming a slot, so selecting "Manual" from the operating mode select entity always fails and points you at the `marstek.set_operating_mode_manual` service instead of guessing a schedule or silently rewriting an existing one. Use that service to write a slot.
 
 ### Passive Mode
 Direct control of battery power. Use the `number.marstek_passive_power` entity or the `marstek.set_operating_mode_passive` service to control the battery:
@@ -205,7 +200,7 @@ power: 240 (desired discharge) -> integration learns to send 275 W -> device rep
 - Learning only happens from valid, settled samples: Passive mode active and acknowledged, the command unchanged for at least 15 seconds, several consecutive stable readings, not mid comms-retry, and not blocked by SOC or a charge/discharge limit.
 - Corrections are gradual (an exponential moving average, not a jump to the latest error) so the command converges without oscillating. Small errors (±10 W) are left alone.
 - The learned mapping persists across Home Assistant restarts and interpolates between known buckets.
-- Commands are clamped to a configurable **Max Passive Power** limit (default 3000 W — set it to your device's actual rated charge/discharge power under **Settings → Devices & Services → Marstek Battery System → Configure**, or at initial setup). If the desired output cannot be reached because the command is already pinned at that limit, the integration stops trying to increase it further and logs a WARNING once per bucket.
+- Commands are clamped to this device's **effective** limit: the lower of your configured **Max Passive Power** option (default 3000 W, adjustable under **Settings → Devices & Services → Marstek Battery System → Configure**, or at initial setup) and a conservative ceiling for the model itself, taken from chapter 4 of the Open API where it documents one (Venus A 1500 W, Venus D 2200 W, Venus E 2500 W). Venus C, the Venus E mini and any unrecognised model have no documented rating and use the configured option alone, up to 3000 W. Raising the option above a known model's own ceiling has no effect; the model's limit still wins. If the desired output cannot be reached because the command is already pinned at that limit, the integration stops trying to increase it further and logs a WARNING once per bucket.
 - The keepalive and retry timers always resend the compensated command, never the raw desired value, so a Home Assistant restart or a dropped Passive session doesn't regress to an uncompensated command.
 
 Enable `custom_components.marstek: debug` in Home Assistant's logger configuration to trace operating-mode commands. New targets, retries, compensation changes, and mode selections include the device name, BLE MAC, host/port, mode, power (when applicable), and source:
@@ -215,7 +210,8 @@ Enable `custom_components.marstek: debug` in Home Assistant's logger configurati
 - `keepalive_retry`: a timer retry following a failed Passive send.
 - `verification_retry`: a resend after fresh polling data fails to confirm the target.
 - `compensation`: a resend after the learned command was adjusted to close the gap between desired and actual output.
-- `operating_mode_select`: an explicit Auto, AI, or Manual selection.
+- `operating_mode_select`: an explicit Auto or AI selection. Selecting Manual here always fails (see [Manual Mode](#manual-mode)); nothing is logged as a command since none is sent.
+- `set_operating_mode_manual`: a Manual schedule slot written through the service.
 
 Routine successful keepalives and timer scheduling are silent. A failed command produces one WARNING with the next action; underlying transport/protocol errors add DEBUG details. Retry attempts and their results remain visible at DEBUG. A command is logged as successful only when the API returns a truthy `set_result`. Confirmation of reported mode/power remains a separate polling step; a verification mismatch logs the desired and commanded power alongside the reported mode and power before retrying.
 
@@ -227,13 +223,13 @@ Marstek passive power: device=Marstek Venus A device_id=AA:BB:CC:DD:EE:01 desire
 
 `source` here is one of `direct` (no calibration yet, or zero power), `calibration` (an exact learned bucket), `interpolation` (between two learned buckets), `extrapolation` (beyond the learned range, carrying the nearest bucket's offset), `compensation` (a resend just triggered by a learning step), or `saturated` (the desired output can't be reached because the command is pinned at a device limit).
 
-**Possible future improvement**: Max Passive Power is currently a single symmetric limit (±the configured value) shared by both charge and discharge. Some devices have different real charge and discharge ratings, so separate `Max Charge Power` / `Max Discharge Power` options would let the compensation clamp each direction to its own actual limit instead of the more conservative shared one.
+**Possible future improvement**: charge and discharge limits are tracked separately internally, but every model published so far has one rating for both, and the Max Passive Power option is still a single symmetric value. A device with genuinely different charge/discharge ratings would need separate `Max Charge Power` / `Max Discharge Power` options exposed in the UI to make use of that.
 
 ## Services
 
 ### marstek.set_operating_mode_manual
 
-Set detailed manual mode schedule (advanced users).
+Write one Manual mode schedule slot (advanced users). Every field is sent exactly as given — nothing is inferred or read back from an existing slot, so an omitted field is never silently reused from what is already configured on the device.
 
 ```yaml
 service: marstek.set_operating_mode_manual
@@ -243,9 +239,12 @@ data:
   start_time: "08:00"
   end_time: "20:00"
   week_set: 127  # Bitmask: 1=Mon, 3=Mon+Tue, 127=All week
-  power: 500  # Power in watts
+  power: 500  # Power in watts; validated against this model's own limit
   enable: true
+  # manual_set: 3  # Required on the Venus E mini, rejected on every other model
 ```
+
+The service validates against the resolved device before sending anything: `time_num` must address a slot the model actually has, `power` must be within its effective limit (see [Adaptive power compensation](#adaptive-power-compensation) above), and `manual_set` (0=disable, 1=charge, 2=discharge, 3=auto) is required on the Venus E mini and rejected on every other model. A validation failure or a command the device refused raises an error to the caller rather than failing silently, so an automation sees it.
 
 **Week Set Values:**
 - Monday: 1
@@ -265,7 +264,7 @@ data:
   cd_time: 3600   # Retained for compatibility; ignored by the integration.
 ```
 
-`power` is the real output you want, not the raw device command — see [Adaptive power compensation](#adaptive-power-compensation) above.
+`power` is the real output you want, not the raw device command — see [Adaptive power compensation](#adaptive-power-compensation) above. Resolution failures or a device-rejected command raise an error to the caller rather than failing silently.
 
 ## Automation Examples
 

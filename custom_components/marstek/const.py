@@ -31,11 +31,11 @@ MODE_PASSIVE = "Passive"
 # so a model's supported modes have exactly one source of truth.
 
 # Manual mode addresses one schedule slot per command through `time_num`.
-# Venus A/C/D/E support 0-9; Venus E mini supports 0-5.
+# Venus A/C/D/E support 0-9; Venus E mini supports 0-5. There is no default
+# slot: every Manual command names its own time_num, via the
+# `marstek.set_operating_mode_manual` service.
 MANUAL_SLOTS_DEFAULT = 10
 MANUAL_SLOTS_E_MINI = 6
-# Selecting Manual from the mode select entity writes this single slot.
-MANUAL_DEFAULT_SLOT = 0
 
 # `manual_set` is an extra manual_cfg field accepted only by the Venus E mini.
 MANUAL_SET_DISABLE = 0
@@ -67,10 +67,28 @@ PASSIVE_COMMAND_MIN = -3000
 PASSIVE_COMMAND_MAX = 3000
 PASSIVE_RESEND_THRESHOLD_W = 5
 
-# The command range defaults to PASSIVE_COMMAND_MAX, but is configurable per
-# entry (Config -> Options) for devices whose real limit is lower.
+# The command range defaults to PASSIVE_COMMAND_MAX. This is a conservative
+# fallback for models the Open API (Rev 3.1, chapter 4) does not document a
+# power rating for (Venus C, Venus E mini) or that were not recognised at all;
+# it is never a promise that a real device can reach it.
 DEFAULT_MAX_PASSIVE_POWER = PASSIVE_COMMAND_MAX
-MAX_PASSIVE_POWER_LIMIT = 30000
+
+# Conservative Passive/Manual power ceilings by hardware power version
+# (chapter 4). Venus A ships as either a 1200 W or 1500 W unit and the API
+# does not say which from Marstek.GetDevice, so the family uses the higher,
+# less restrictive of the two documented variants; treat it as a ceiling, not
+# a promise the specific unit can reach it. An 800 W version is documented but
+# not tied to a named model, so it is not assigned here. Venus C and the Venus
+# E mini have no documented power rating and keep DEFAULT_MAX_PASSIVE_POWER.
+PASSIVE_POWER_LIMIT_VENUS_A_W = 1500
+PASSIVE_POWER_LIMIT_VENUS_D_W = 2200
+PASSIVE_POWER_LIMIT_VENUS_E_W = 2500
+
+# Upper bound for the user-configurable Max Passive Power option. A device's
+# own capability limit (above) is always the tighter of the two in practice;
+# this only stops the option itself from being set to something absurd for a
+# model this integration cannot yet size, such as an unrecognised model.
+MAX_PASSIVE_POWER_LIMIT = DEFAULT_MAX_PASSIVE_POWER
 
 # Sample validity. One learning step needs a settled command plus several
 # consecutive stable measurements, so it spans multiple 30s polls by design.

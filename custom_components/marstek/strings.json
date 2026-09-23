@@ -10,7 +10,7 @@
           "max_passive_power": "Max Passive Power (W)"
         },
         "data_description": {
-          "max_passive_power": "The highest charge/discharge power your device actually supports. Passive-mode commands are clamped to this range."
+          "max_passive_power": "The highest charge/discharge power your device actually supports. Passive-mode commands are clamped to this range, or to your model's own known limit if that is lower."
         }
       }
     },
@@ -31,7 +31,7 @@
           "max_passive_power": "Max Passive Power (W)"
         },
         "data_description": {
-          "max_passive_power": "The highest charge/discharge power your device actually supports. Passive-mode commands are clamped to this range."
+          "max_passive_power": "The highest charge/discharge power your device actually supports. Passive-mode commands are clamped to this range, or to your model's own known limit if that is lower."
         }
       }
     }

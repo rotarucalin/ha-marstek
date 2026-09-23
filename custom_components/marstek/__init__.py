@@ -26,8 +26,6 @@ from .const import (
     CONF_MAX_PASSIVE_POWER,
     DEFAULT_MAX_PASSIVE_POWER,
     DOMAIN,
-    MANUAL_DEFAULT_SLOT,
-    MANUAL_SET_AUTO,
     MODE_AI,
     MODE_AUTO,
     MODE_MANUAL,
@@ -222,10 +220,18 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._passive_poll_active = False
         self._passive_charge_recovery_blocked = False
         self._calibration_store = store
+        # The option is the ceiling the user asked for; the model's own
+        # hardware rating (capabilities.passive_power_range) can only tighten
+        # it further, never loosen it. Kept so a later capability refresh can
+        # recompute the effective range without forgetting this input.
+        self._configured_max_passive_power = max_passive_power
+        command_min, command_max = self._capabilities.passive_power_range(
+            self._configured_max_passive_power
+        )
         self.calibration = PassiveCalibration.from_dict(
             calibration_data,
-            command_min=-max_passive_power,
-            command_max=max_passive_power,
+            command_min=command_min,
+            command_max=command_max,
         )
 
         super().__init__(
@@ -235,6 +241,19 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             config_entry=entry,
             update_interval=SCAN_INTERVAL,
         )
+
+    def _apply_passive_power_range(self) -> None:
+        """Recompute the effective Passive/Manual command range and re-clamp.
+
+        Called on init and whenever the capability resolution changes (a
+        cached guess replaced by a live-confirmed model). The configured Max
+        Passive Power option can only tighten this model's own hardware
+        ceiling further, never loosen it.
+        """
+        command_min, command_max = self._capabilities.passive_power_range(
+            self._configured_max_passive_power
+        )
+        self.calibration.set_command_range(command_min, command_max)
 
     @property
     def capabilities(self) -> MarstekCapabilities:
@@ -291,6 +310,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             self.device_info.update(device_metadata(info))
             self.device_info["ble_mac"] = self.device_id
             self._capabilities = resolve_capabilities(self.device_info.get("device"))
+            self._apply_passive_power_range()
             self._device_info_fetched = bool(self.device_info.get("device"))
             self._identity_mismatch = False
             if (
@@ -404,7 +424,14 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
     async def async_set_operating_mode(
         self, mode: str, *, source: str = "operating_mode_select"
     ) -> bool:
-        """Set an operating mode, superseding any passive power target."""
+        """Set an operating mode, superseding any passive power target.
+
+        Manual has no safe parameterless form: every command addresses one
+        schedule slot, so a mode change alone would have to either invent a
+        schedule or silently overwrite whatever is already in a slot. Use
+        `async_set_manual_schedule` (the `marstek.set_operating_mode_manual`
+        service) instead, which always requires the caller to state a slot.
+        """
         async with self._passive_command_lock:
             if self._identity_mismatch:
                 _LOGGER.warning(
@@ -425,13 +452,88 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                     self.capabilities.model,
                 )
                 return False
+            if mode == MODE_MANUAL:
+                _LOGGER.warning(
+                    "Marstek command blocked: device=%s source=%s mode=%s "
+                    "error=Manual has no default schedule; call the "
+                    "marstek.set_operating_mode_manual service with an "
+                    "explicit time_num instead",
+                    self.entry.title,
+                    source,
+                    mode,
+                )
+                return False
             if mode == MODE_PASSIVE:
                 return True
 
             self._clear_passive_control()
 
+            return await self._async_send_mode_command(mode=mode, source=source)
+
+    async def async_set_manual_schedule(
+        self,
+        *,
+        time_num: int,
+        start_time: str,
+        end_time: str,
+        week_set: int,
+        power: int,
+        enable: int,
+        manual_set: int | None = None,
+        source: str = "set_operating_mode_manual",
+    ) -> bool:
+        """Write exactly one Manual schedule slot, superseding Passive control.
+
+        Every field is caller-supplied. Nothing here is invented or read back
+        from an existing slot; the caller (the `marstek.set_operating_mode_manual`
+        service) owns choosing a safe schedule.
+        """
+        async with self._passive_command_lock:
+            if self._identity_mismatch:
+                _LOGGER.warning(
+                    "Marstek command blocked: device=%s source=%s mode=%s "
+                    "error=device identity mismatch",
+                    self.entry.title,
+                    source,
+                    MODE_MANUAL,
+                )
+                return False
+            if not self.capabilities.supports_mode(MODE_MANUAL):
+                _LOGGER.warning(
+                    "Marstek command blocked: device=%s source=%s mode=%s "
+                    "error=%s does not support this mode",
+                    self.entry.title,
+                    source,
+                    MODE_MANUAL,
+                    self.capabilities.model,
+                )
+                return False
+            if not self.capabilities.is_valid_manual_slot(time_num):
+                _LOGGER.warning(
+                    "Marstek command blocked: device=%s source=%s mode=%s "
+                    "error=%s has no Manual slot %s",
+                    self.entry.title,
+                    source,
+                    MODE_MANUAL,
+                    self.capabilities.model,
+                    time_num,
+                )
+                return False
+
+            self._clear_passive_control()
+
             return await self._async_send_mode_command(
-                mode=mode, power=100 if mode == MODE_MANUAL else None, source=source
+                mode=MODE_MANUAL,
+                source=source,
+                manual_params={
+                    "time_num": time_num,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "week_set": week_set,
+                    "power": power,
+                    "enable": enable,
+                    "manual_set": manual_set,
+                },
             )
 
     async def async_stop_passive_control(self) -> None:
@@ -440,7 +542,12 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             self._clear_passive_control()
 
     async def _async_send_mode_command(
-        self, *, mode: str, source: str, power: int | None = None
+        self,
+        *,
+        mode: str,
+        source: str,
+        power: int | None = None,
+        manual_params: dict | None = None,
     ) -> bool:
         """Log and send a mode command using the API's set_result semantics.
 
@@ -455,24 +562,20 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             command, args = self.api.set_es_mode_auto, ()
         elif mode == MODE_AI:
             command, args = self.api.set_es_mode_ai, ()
-        elif mode == MODE_MANUAL and power is not None:
-            if not self.capabilities.is_valid_manual_slot(MANUAL_DEFAULT_SLOT):
-                _LOGGER.warning(
-                    "Marstek command blocked: device=%s source=%s mode=%s "
-                    "error=%s has no Manual slot %s",
-                    self.entry.title,
-                    source,
-                    mode,
-                    self.capabilities.model,
-                    MANUAL_DEFAULT_SLOT,
-                )
-                return False
+        elif mode == MODE_MANUAL and manual_params is not None:
+            args = (
+                manual_params["time_num"],
+                manual_params["start_time"],
+                manual_params["end_time"],
+                manual_params["week_set"],
+                manual_params["power"],
+                manual_params["enable"],
+            )
             # manual_cfg only accepts manual_set on the Venus E mini, where it
-            # selects the slot's direction; other models reject the field, so
-            # their command stays exactly as it was before capabilities existed.
-            args = (MANUAL_DEFAULT_SLOT, "00:00", "23:59", 127, power, 1)
-            if self.capabilities.supports_manual_set:
-                args += (MANUAL_SET_AUTO,)
+            # selects the slot's direction; other models reject the field.
+            manual_set = manual_params.get("manual_set")
+            if manual_set is not None:
+                args += (manual_set,)
             command = self.api.set_es_mode_manual
         else:
             return False
@@ -484,13 +587,17 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         )
         if power is not None:
             context += f" power={power}W"
-        if mode == MODE_MANUAL:
+        if mode == MODE_MANUAL and manual_params is not None:
             context += (
-                f" time_num={MANUAL_DEFAULT_SLOT} start_time=00:00 end_time=23:59 "
-                "week_set=127 enable=1"
+                f" time_num={manual_params['time_num']} "
+                f"start_time={manual_params['start_time']} "
+                f"end_time={manual_params['end_time']} "
+                f"week_set={manual_params['week_set']} "
+                f"power={manual_params['power']}W "
+                f"enable={manual_params['enable']}"
             )
-            if self.capabilities.supports_manual_set:
-                context += f" manual_set={MANUAL_SET_AUTO}"
+            if manual_params.get("manual_set") is not None:
+                context += f" manual_set={manual_params['manual_set']}"
         if source != "keepalive":
             _LOGGER.debug("Marstek command: %s", context)
         error = "API returned failure (request failed or set_result missing/false)"
@@ -501,7 +608,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             "source": source,
             "mode": mode,
             "desired_w": self._passive_desired_power,
-            "command_w": power,
+            "command_w": power if manual_params is None else manual_params.get("power"),
             "success": None,
         }
         try:

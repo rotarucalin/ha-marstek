@@ -5,10 +5,11 @@ from __future__ import annotations
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import MarstekDataUpdateCoordinator
-from .const import DOMAIN
+from .const import DOMAIN, MODE_MANUAL
 from .entity import MarstekEntity
 
 
@@ -53,3 +54,13 @@ class MarstekOperatingModeSelect(MarstekEntity, SelectEntity):
 
         if success:
             await self.coordinator.async_request_refresh()
+            return
+
+        if option == MODE_MANUAL:
+            # There is no safe schedule to invent here; tell the caller where
+            # to actually set one instead of failing silently.
+            raise HomeAssistantError(
+                "Marstek Manual mode needs an explicit schedule; use the "
+                "marstek.set_operating_mode_manual service instead of the "
+                "Operating Mode selector"
+            )

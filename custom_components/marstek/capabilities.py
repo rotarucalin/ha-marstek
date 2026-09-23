@@ -17,17 +17,23 @@ import re
 from dataclasses import dataclass
 
 from .const import (
+    DEFAULT_MAX_PASSIVE_POWER,
     DEVICE_VENUS_A,
     DEVICE_VENUS_C,
     DEVICE_VENUS_D,
     DEVICE_VENUS_E,
     DEVICE_VENUS_E_MINI,
+    MANUAL_SET_AUTO,
+    MANUAL_SET_DISABLE,
     MANUAL_SLOTS_DEFAULT,
     MANUAL_SLOTS_E_MINI,
     MODE_AI,
     MODE_AUTO,
     MODE_MANUAL,
     MODE_PASSIVE,
+    PASSIVE_POWER_LIMIT_VENUS_A_W,
+    PASSIVE_POWER_LIMIT_VENUS_D_W,
+    PASSIVE_POWER_LIMIT_VENUS_E_W,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -58,6 +64,19 @@ class MarstekCapabilities:
     supports_manual_set: bool = False
     """Whether manual_cfg accepts `manual_set` (Venus E mini only)."""
 
+    passive_charge_limit_w: int = DEFAULT_MAX_PASSIVE_POWER
+    """Conservative ceiling (W) for a charge (negative) Passive/Manual command."""
+
+    passive_discharge_limit_w: int = DEFAULT_MAX_PASSIVE_POWER
+    """Conservative ceiling (W) for a discharge (positive) Passive/Manual command.
+
+    Charge and discharge are tracked separately so a future model with an
+    asymmetric rating needs only its own two values here, not a new field.
+    They are equal for every model published so far because the Open API
+    (Rev 3.1, chapter 4) documents a single power rating per model, not one
+    per direction.
+    """
+
     known: bool = True
     """False when the reported model was not in the table and defaults are used."""
 
@@ -71,13 +90,53 @@ class MarstekCapabilities:
             return False
         return 0 <= time_num < self.manual_slots
 
+    def is_valid_manual_set(self, manual_set: object) -> bool:
+        """Return whether `manual_set` is one of the four documented values."""
+        if not isinstance(manual_set, int) or isinstance(manual_set, bool):
+            return False
+        return MANUAL_SET_DISABLE <= manual_set <= MANUAL_SET_AUTO
+
+    def passive_power_range(
+        self, configured_limit: int | None = None
+    ) -> tuple[int, int]:
+        """Return the (min, max) command power in watts this model accepts.
+
+        `configured_limit` is the user's own Max Passive Power option; when
+        given, it can only tighten the range further, never loosen it beyond
+        this model's own hardware ceiling. Without it, this returns the bare
+        hardware limit, which is what a Manual command is checked against
+        since it has no separate user-configurable ceiling.
+        """
+        charge_limit = self.passive_charge_limit_w
+        discharge_limit = self.passive_discharge_limit_w
+        if configured_limit is not None:
+            charge_limit = min(charge_limit, configured_limit)
+            discharge_limit = min(discharge_limit, configured_limit)
+        return -charge_limit, discharge_limit
+
 
 # Venus A/C/D/E support Manual slots 0-9 and reject `manual_set`; only the
-# Venus E mini differs, and only Venus A/D answer PV.GetStatus.
-_VENUS_A = MarstekCapabilities(model=DEVICE_VENUS_A, supports_pv=True)
+# Venus E mini differs, and only Venus A/D answer PV.GetStatus. Venus C and
+# the Venus E mini have no documented power rating (chapter 4), so they keep
+# the conservative DEFAULT_MAX_PASSIVE_POWER fallback for both directions.
+_VENUS_A = MarstekCapabilities(
+    model=DEVICE_VENUS_A,
+    supports_pv=True,
+    passive_charge_limit_w=PASSIVE_POWER_LIMIT_VENUS_A_W,
+    passive_discharge_limit_w=PASSIVE_POWER_LIMIT_VENUS_A_W,
+)
 _VENUS_C = MarstekCapabilities(model=DEVICE_VENUS_C)
-_VENUS_D = MarstekCapabilities(model=DEVICE_VENUS_D, supports_pv=True)
-_VENUS_E = MarstekCapabilities(model=DEVICE_VENUS_E)
+_VENUS_D = MarstekCapabilities(
+    model=DEVICE_VENUS_D,
+    supports_pv=True,
+    passive_charge_limit_w=PASSIVE_POWER_LIMIT_VENUS_D_W,
+    passive_discharge_limit_w=PASSIVE_POWER_LIMIT_VENUS_D_W,
+)
+_VENUS_E = MarstekCapabilities(
+    model=DEVICE_VENUS_E,
+    passive_charge_limit_w=PASSIVE_POWER_LIMIT_VENUS_E_W,
+    passive_discharge_limit_w=PASSIVE_POWER_LIMIT_VENUS_E_W,
+)
 _VENUS_E_MINI = MarstekCapabilities(
     model=DEVICE_VENUS_E_MINI,
     manual_slots=MANUAL_SLOTS_E_MINI,

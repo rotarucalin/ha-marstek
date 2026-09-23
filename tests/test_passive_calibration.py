@@ -182,3 +182,61 @@ def test_clear_forgets_everything_learned():
     calibration.observe(-500, -500, -470)
     calibration.clear()
     assert calibration.is_empty
+
+
+# --- Device-aware command range ---------------------------------------------
+
+
+def test_construction_clamps_a_tighter_range_immediately():
+    """A model with a lower hardware limit than the legacy default is honored."""
+    calibration = PassiveCalibration(command_min=-1500, command_max=1500)
+    assert calibration.command_for(2000) == (1500, SOURCE_DIRECT)
+    assert calibration.command_for(-2000) == (-1500, SOURCE_DIRECT)
+
+
+def test_load_clamps_oversized_persisted_values_to_a_tighter_range():
+    """A calibration learned under a looser (or absent) limit loads clamped.
+
+    This is what protects a device whose model was only confirmed after an
+    unconfirmed/looser guess had already saved a calibration: reloading under
+    the real, tighter limit must not let an old value bypass it.
+    """
+    loose = PassiveCalibration(command_min=-3000, command_max=3000)
+    loose.observe(2980, 2980, 2000)  # saturates at the loose 3000 W ceiling
+    payload = loose.to_dict()
+
+    tight = PassiveCalibration.from_dict(payload, command_min=-1500, command_max=1500)
+    command, source = tight.command_for(2980)
+    assert command == 1500
+    assert source == SOURCE_CALIBRATION
+
+
+def test_set_command_range_reclamps_existing_learned_entries():
+    """Tightening the range in place clamps what was already learned."""
+    calibration = PassiveCalibration(command_min=-3000, command_max=3000)
+    calibration.observe(2980, 2980, 2000)  # learns close to 3000
+    assert calibration.command_for(2980)[0] > 1500
+
+    calibration.set_command_range(-1500, 1500)
+    assert calibration.command_max == 1500
+    assert calibration.command_min == -1500
+    assert calibration.command_for(2980) == (1500, SOURCE_CALIBRATION)
+
+
+def test_set_command_range_also_governs_future_observations():
+    """A command learned after tightening the range never exceeds it either."""
+    calibration = PassiveCalibration(command_min=-3000, command_max=3000)
+    calibration.set_command_range(-1500, 1500)
+
+    result = calibration.observe(1600, 1600, 1000)
+    assert result.learned == 1500
+    assert result.saturated is True
+
+
+def test_set_command_range_can_loosen_too():
+    """Widening the range (a corrected, higher device limit) is not one-way."""
+    calibration = PassiveCalibration(command_min=-1500, command_max=1500)
+    assert calibration.command_for(2000) == (1500, SOURCE_DIRECT)
+
+    calibration.set_command_range(-2200, 2200)
+    assert calibration.command_for(2000) == (2000, SOURCE_DIRECT)

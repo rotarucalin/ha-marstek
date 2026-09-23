@@ -203,11 +203,20 @@ Chapter 4 of the PDF, verbatim in substance:
 | Venus D / Venus A | Marstek, WiFi, Bluetooth, Battery, **PV**, ES, EM, SYS (firmware >= 150) |
 | Venus E mini | Marstek, WiFi, Bluetooth, Battery, ES, EM, SYS (DOD, Ble_block, Led_Ctrl only) |
 
-So exactly two capability axes are documented as varying between models:
+So exactly three capability axes are documented as varying between models:
 
 1. PV presence. Venus A and Venus D only.
 2. Manual mode. The E mini has six time periods instead of ten and accepts
    `manual_set`.
+3. Power rating, from `Set.Ver`'s documented values (3.8): 800, 1200/1500
+   (Venus A), 2200 (Venus D), 2500 (Venus E). Venus C and the Venus E mini have
+   no documented rating. The integration treats these as conservative Passive/
+   Manual command ceilings per model, **not** as proof of a specific unit's
+   real rating (Venus A ships as either the 1200 W or 1500 W variant and
+   `Marstek.GetDevice` does not say which, so the higher, less restrictive of
+   the two is used). The integration never calls `Set.Ver` itself; it is a
+   configuration write, not a query, and sending it would change the device's
+   own power version rather than read it.
 
 Everything else in the API is common to all five models. No model is documented
 as lacking any ES mode, so the integration offers all four to every model.

@@ -12,7 +12,7 @@ set_operating_mode_passive:
           integration: marstek
     power:
       name: Power
-      description: Desired real battery output in watts. Positive discharges, negative charges. The integration automatically compensates for inverter/standby losses so this reflects actual output, not the raw device command. Values beyond your device's configured Max Passive Power are clamped.
+      description: Desired real battery output in watts. Positive discharges, negative charges. The integration automatically compensates for inverter/standby losses so this reflects actual output, not the raw device command. Values beyond your device's effective limit (the lower of its hardware rating and your configured Max Passive Power) are clamped.
       required: true
       example: 800
       selector:
@@ -30,5 +30,82 @@ set_operating_mode_passive:
         number:
           min: 1
           max: 86400
+          step: 1
+          mode: box
+
+set_operating_mode_manual:
+  name: Set Manual mode schedule
+  description: Write one Manual mode schedule slot. Every field is sent exactly as given; nothing is inferred or read back from an existing slot.
+  fields:
+    entity_id:
+      name: Entity ID
+      description: The operating mode select entity for the Marstek device.
+      required: true
+      selector:
+        entity:
+          domain: select
+          integration: marstek
+    time_num:
+      name: Time period
+      description: Schedule slot index. 0-9 on Venus A/C/D/E; 0-5 on the Venus E mini. Rejected if the device does not have this slot.
+      required: true
+      example: 0
+      selector:
+        number:
+          min: 0
+          max: 9
+          step: 1
+          mode: box
+    start_time:
+      name: Start time
+      description: Slot start time, HH:MM (24-hour).
+      required: true
+      example: "08:00"
+      selector:
+        time:
+    end_time:
+      name: End time
+      description: Slot end time, HH:MM (24-hour).
+      required: true
+      example: "20:00"
+      selector:
+        time:
+    week_set:
+      name: Days
+      description: Bitmask of active days, low 7 bits (1=Mon, 2=Tue, 4=Wed, 8=Thu, 16=Fri, 32=Sat, 64=Sun). 127 is every day.
+      required: true
+      example: 127
+      selector:
+        number:
+          min: 0
+          max: 127
+          step: 1
+          mode: box
+    power:
+      name: Power
+      description: Slot power in watts. Positive discharges, negative charges. Rejected if it exceeds this device's effective power limit.
+      required: true
+      example: 500
+      selector:
+        number:
+          min: -3000
+          max: 3000
+          step: 10
+          mode: box
+    enable:
+      name: Enabled
+      description: Whether this slot is active.
+      required: true
+      default: true
+      selector:
+        boolean:
+    manual_set:
+      name: Manual set
+      description: Slot direction. Required on the Venus E mini (0=disable, 1=charge, 2=discharge, 3=auto); rejected on every other model.
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 3
           step: 1
           mode: box

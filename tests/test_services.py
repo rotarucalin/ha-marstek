@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -174,7 +175,10 @@ async def test_service_rejects_unknown_entity(
     hass.data[DOMAIN] = {"entry_one": coordinator}
     await async_register_services(hass)
 
-    with caplog.at_level(logging.ERROR):
+    with (
+        caplog.at_level(logging.ERROR),
+        pytest.raises(ServiceValidationError),
+    ):
         await _call_service(hass, "select.unknown_marstek_entity")
 
     coordinator.async_set_passive_power.assert_not_awaited()
@@ -208,7 +212,10 @@ async def test_service_rejects_entity_from_another_integration(
     )
     await async_register_services(hass)
 
-    with caplog.at_level(logging.ERROR):
+    with (
+        caplog.at_level(logging.ERROR),
+        pytest.raises(ServiceValidationError),
+    ):
         await _call_service(hass, entity_id)
 
     coordinator.async_set_passive_power.assert_not_awaited()
@@ -239,7 +246,35 @@ async def test_service_rejects_missing_config_entry_or_coordinator(
     )
     await async_register_services(hass)
 
-    with caplog.at_level(logging.ERROR):
+    with (
+        caplog.at_level(logging.ERROR),
+        pytest.raises(ServiceValidationError),
+    ):
         await _call_service(hass, entity_id)
 
     assert f"Could not resolve Marstek device for entity_id={entity_id}" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_service_raises_when_the_coordinator_command_fails(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """A device-rejected Passive command must fail the service call, not just log."""
+    config_entry = _add_config_entry(hass, "entry_one")
+    coordinator = AsyncMock()
+    coordinator.async_set_passive_power.return_value = False
+    hass.data[DOMAIN] = {config_entry.entry_id: coordinator}
+    entity_id = "select.marstek_battery_system_operating_mode"
+    _register_entity(
+        entity_registry,
+        config_entry,
+        entity_id,
+        unique_id="first_operating_mode",
+    )
+    await async_register_services(hass)
+
+    with pytest.raises(HomeAssistantError):
+        await _call_service(hass, entity_id)
+
+    coordinator.async_set_passive_power.assert_awaited_once_with(-500)

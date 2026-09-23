@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, call, patch
 
 import pytest
 from homeassistant.core import HassJob, HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
@@ -244,6 +245,26 @@ async def test_failed_keepalives_retry_until_success(
     mock_marstek_api.set_es_mode_auto.assert_not_called()
 
 
+async def test_internal_keepalive_failure_never_raises_a_service_exception(
+    coordinator, command_timers, mock_marstek_api
+):
+    """Only a user-facing service call raises; internal maintenance never does.
+
+    The retry mechanism added for services.py failure propagation must not
+    leak into the keepalive/retry path: a failed keepalive is HA's normal
+    "the awaited coroutine can raise" contract, so if this call ever raised,
+    the timer callback itself would crash instead of scheduling a retry.
+    """
+    mock_marstek_api.set_es_mode_passive.side_effect = [True, False]
+    assert await coordinator.async_set_passive_power(240)
+    keepalive = command_timers.current
+
+    await keepalive.fire()  # must not raise
+
+    assert coordinator._passive_desired_power == 240
+    assert command_timers.current.delay == 15
+
+
 async def test_failed_initial_target_also_retries(
     coordinator, command_timers, mock_marstek_api, caplog
 ):
@@ -278,7 +299,7 @@ async def test_new_target_supersedes_pending_retry(
     assert command_timers.current.delay == 180
 
 
-@pytest.mark.parametrize("mode", ["Auto", "AI", "Manual"])
+@pytest.mark.parametrize("mode", ["Auto", "AI"])
 @pytest.mark.parametrize("success", [True, False])
 async def test_select_stops_retries_even_if_mode_command_fails(
     coordinator, command_timers, mock_marstek_api, caplog, mode, success
@@ -302,13 +323,35 @@ async def test_select_stops_retries_even_if_mode_command_fails(
     await coordinator._async_verify_passive_power({"mode": "Auto"})
     assert not command_timers.active
     mock_marstek_api.set_es_mode_passive.assert_called_once_with(240)
-    if mode == "Manual":
-        command.assert_called_once_with(0, "00:00", "23:59", 127, 100, 1)
-    else:
-        command.assert_called_once_with()
+    command.assert_called_once_with()
     assert f"source=operating_mode_select method=ES.SetMode mode={mode}" in caplog.text
     failures = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(failures) == int(not success)
+
+
+async def test_selecting_manual_never_sends_a_command_and_leaves_passive_alone(
+    coordinator, command_timers, mock_marstek_api, caplog
+):
+    """Manual has no safe schedule to invent; a live Passive target must survive.
+
+    Unlike Auto/AI, nothing is actually sent to the device for a rejected
+    Manual selection, so unlike them it must not tear down passive control:
+    the device is still in Passive mode and still needs its keepalive/retry.
+    """
+    mock_marstek_api.set_es_mode_passive.return_value = False
+    await coordinator.async_set_passive_power(240)
+    retry = command_timers.current
+    caplog.clear()
+    with patch.object(
+        coordinator, "async_request_refresh", new_callable=AsyncMock
+    ) as refresh:
+        with pytest.raises(HomeAssistantError):
+            await MarstekOperatingModeSelect(coordinator).async_select_option("Manual")
+        refresh.assert_not_awaited()
+    mock_marstek_api.set_es_mode_manual.assert_not_called()
+    assert command_timers.current is retry
+    assert coordinator._passive_desired_power == 240
+    assert not outgoing_messages(caplog)
 
 
 async def test_selecting_passive_does_not_send_or_replace_target(
@@ -478,19 +521,32 @@ async def test_integration_unload_cancels_timer(
 async def test_service_behavior_and_logging(
     hass, coordinator, command_timers, mock_marstek_api, caplog, success
 ):
-    """The service schema, cd_time compatibility and return behavior stay."""
+    """The service schema, cd_time compatibility and return behavior stay.
+
+    A failed API command still leaves every internal side effect (the sent
+    command, the retained target, the scheduled retry, the warning) exactly as
+    before; only the service call itself now also fails, so an automation
+    calling it sees the failure instead of a silent success.
+    """
     hass.data[DOMAIN] = {coordinator.entry.entry_id: coordinator}
     entity = er.async_get(hass).async_get_or_create(
         "select", DOMAIN, "mode", config_entry=coordinator.entry
     )
     await async_register_services(hass)
     mock_marstek_api.set_es_mode_passive.return_value = success
-    await hass.services.async_call(
+
+    call = hass.services.async_call(
         DOMAIN,
         "set_operating_mode_passive",
         {"entity_id": entity.entity_id, "power": -500, "cd_time": 86400},
         blocking=True,
     )
+    if success:
+        await call
+    else:
+        with pytest.raises(HomeAssistantError):
+            await call
+
     mock_marstek_api.set_es_mode_passive.assert_called_once_with(-500)
     assert coordinator._passive_desired_power == -500
     assert command_timers.current.delay == (180 if success else 15)

@@ -26,6 +26,9 @@ from custom_components.marstek.const import (
     DEVICE_VENUS_E_MINI,
     DOMAIN,
     MANUAL_SET_AUTO,
+    MANUAL_SET_CHARGE,
+    MANUAL_SET_DISABLE,
+    MANUAL_SET_DISCHARGE,
     MANUAL_SLOTS_DEFAULT,
     MANUAL_SLOTS_E_MINI,
     MODE_AUTO,
@@ -402,41 +405,128 @@ async def test_mode_select_offers_the_models_modes(
 
 
 @pytest.mark.asyncio
-async def test_e_mini_manual_command_sends_manual_set(coordinator, mock_marstek_api):
+@pytest.mark.parametrize("reported", ["VenusA", "VenusC", "VenusD", "VenusE", "VNSEM-0"])
+async def test_selecting_manual_never_sends_a_schedule(
+    coordinator, mock_marstek_api, reported
+):
+    """Selecting Manual has no safe parameterless form; it must always fail clean.
+
+    This applies to every model, including the E mini: there is no schedule
+    this integration could invent that would not risk overwriting a real one.
+    """
+    mock_marstek_api.get_device_info.return_value = {
+        "device": reported,
+        "ble_mac": "AA:BB:CC:DD:EE:01",
+    }
+    await coordinator._async_update_data()
+    assert not await coordinator.async_set_operating_mode(MODE_MANUAL)
+    mock_marstek_api.set_es_mode_manual.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_manual_schedule_sends_manual_set_on_e_mini(coordinator, mock_marstek_api):
     """The E mini needs manual_set to give the slot a direction."""
     mock_marstek_api.get_device_info.return_value = {
         "device": "VNSEM-0",
         "ble_mac": "AA:BB:CC:DD:EE:01",
     }
     await coordinator._async_update_data()
-    assert await coordinator.async_set_operating_mode(MODE_MANUAL)
+    assert await coordinator.async_set_manual_schedule(
+        time_num=2,
+        start_time="08:00",
+        end_time="20:00",
+        week_set=127,
+        power=300,
+        enable=1,
+        manual_set=MANUAL_SET_AUTO,
+    )
     mock_marstek_api.set_es_mode_manual.assert_called_once_with(
-        0, "00:00", "23:59", 127, 100, 1, MANUAL_SET_AUTO
+        2, "08:00", "20:00", 127, 300, 1, MANUAL_SET_AUTO
     )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reported", ["VenusA", "VenusC", "VenusD", "VenusE"])
-async def test_other_models_omit_manual_set(coordinator, mock_marstek_api, reported):
-    """Venus A/C/D/E must keep sending the unchanged six-field manual_cfg."""
+async def test_manual_schedule_omits_manual_set_on_other_models(
+    coordinator, mock_marstek_api, reported
+):
+    """Venus A/C/D/E must keep sending the documented six-field manual_cfg."""
     mock_marstek_api.get_device_info.return_value = {
         "device": reported,
         "ble_mac": "AA:BB:CC:DD:EE:01",
     }
     await coordinator._async_update_data()
-    assert await coordinator.async_set_operating_mode(MODE_MANUAL)
-    # The call is unchanged from before capabilities existed: no seventh argument.
-    mock_marstek_api.set_es_mode_manual.assert_called_once_with(
-        0, "00:00", "23:59", 127, 100, 1
+    assert await coordinator.async_set_manual_schedule(
+        time_num=5,
+        start_time="08:00",
+        end_time="20:00",
+        week_set=127,
+        power=300,
+        enable=1,
+        manual_set=None,
     )
+    mock_marstek_api.set_es_mode_manual.assert_called_once_with(
+        5, "08:00", "20:00", 127, 300, 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_manual_schedule_rejects_slot_beyond_e_mini_range(
+    coordinator, mock_marstek_api
+):
+    """Slot 6 does not exist on the E mini (0-5); the command must not be sent."""
+    mock_marstek_api.get_device_info.return_value = {
+        "device": "VNSEM-0",
+        "ble_mac": "AA:BB:CC:DD:EE:01",
+    }
+    await coordinator._async_update_data()
+    assert not await coordinator.async_set_manual_schedule(
+        time_num=6,
+        start_time="08:00",
+        end_time="20:00",
+        week_set=127,
+        power=300,
+        enable=1,
+        manual_set=MANUAL_SET_AUTO,
+    )
+    mock_marstek_api.set_es_mode_manual.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_manual_schedule_does_not_disturb_active_passive_control(
+    coordinator, mock_marstek_api
+):
+    """A rejected Manual command must not clear a live Passive target."""
+    await coordinator._async_update_data()
+    assert await coordinator.async_set_passive_power(240)
+    assert not await coordinator.async_set_manual_schedule(
+        time_num=99,
+        start_time="08:00",
+        end_time="20:00",
+        week_set=127,
+        power=300,
+        enable=1,
+    )
+    assert coordinator._passive_desired_power == 240
 
 
 @pytest.mark.parametrize(
     ("manual_set", "expected"),
-    [(None, {}), (MANUAL_SET_AUTO, {"manual_set": 3}), (0, {"manual_set": 0})],
+    [
+        (None, {}),
+        (MANUAL_SET_DISABLE, {"manual_set": 0}),
+        (MANUAL_SET_CHARGE, {"manual_set": 1}),
+        (MANUAL_SET_DISCHARGE, {"manual_set": 2}),
+        (MANUAL_SET_AUTO, {"manual_set": 3}),
+    ],
 )
 def test_api_includes_manual_set_only_when_given(manual_set, expected):
-    """manual_cfg keeps its documented six fields unless manual_set is passed."""
+    """manual_cfg keeps its documented six fields unless manual_set is passed.
+
+    Covers the raw wire payload for a normal Venus command (no manual_set) and
+    every documented `manual_set` value an E mini can send: disable, charge,
+    discharge and auto.
+    """
     api = MarstekAPI("192.0.2.1")
     with patch("custom_components.marstek.marstek_api.socket.socket") as socket:
         connection = socket.return_value.__enter__.return_value

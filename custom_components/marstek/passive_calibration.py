@@ -96,6 +96,22 @@ class PassiveCalibration:
         """Constrain a command power to the range the device accepts."""
         return max(self.command_min, min(self.command_max, value))
 
+    def set_command_range(self, command_min: int, command_max: int) -> None:
+        """Tighten or loosen the accepted range, re-clamping learned entries.
+
+        Called when the effective device limit changes after construction —
+        typically because the model was only confirmed (from a cached guess)
+        after a live poll, or the configured Max Passive Power option changed.
+        Already-learned command values outside the new range are clamped in
+        place rather than discarded: the desired-output mapping they represent
+        is still valid, only the achievable command may have moved.
+        """
+        self.command_min = command_min
+        self.command_max = command_max
+        for table in self._maps.values():
+            for bucket in list(table):
+                table[bucket] = self.clamp(table[bucket])
+
     def is_saturated(self, command: float) -> bool:
         """Return whether a command already sits at a device limit."""
         return command <= self.command_min or command >= self.command_max

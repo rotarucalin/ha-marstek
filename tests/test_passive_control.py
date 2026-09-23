@@ -354,6 +354,122 @@ async def test_selecting_manual_never_sends_a_command_and_leaves_passive_alone(
     assert not outgoing_messages(caplog)
 
 
+# --- Manual command ordering: Passive is torn down only after acknowledgement ---
+
+
+async def test_manual_success_clears_active_passive_control(
+    coordinator, command_timers, mock_marstek_api
+):
+    """A device-accepted Manual command may now retire the old Passive target."""
+    await coordinator.async_set_passive_power(240)
+    assert command_timers.active
+    mock_marstek_api.set_es_mode_manual.return_value = True
+
+    assert await coordinator.async_set_manual_schedule(
+        time_num=0,
+        start_time="08:00",
+        end_time="20:00",
+        week_set=127,
+        power=300,
+        enable=1,
+    )
+
+    assert not command_timers.active
+    assert coordinator._passive_desired_power is None
+    assert coordinator._passive_command_power is None
+    assert coordinator.passive_power_state == "unknown"
+
+
+async def test_manual_failure_leaves_active_passive_control_untouched(
+    coordinator, command_timers, mock_marstek_api
+):
+    """A device-rejected Manual command must not stop the Passive countdown."""
+    await coordinator.async_set_passive_power(240)
+    keepalive = command_timers.current
+    state_before = coordinator.passive_power_state
+    mock_marstek_api.set_es_mode_manual.return_value = False
+
+    with patch.object(coordinator, "_clear_passive_control") as clear_mock:
+        assert not await coordinator.async_set_manual_schedule(
+            time_num=0,
+            start_time="08:00",
+            end_time="20:00",
+            week_set=127,
+            power=300,
+            enable=1,
+        )
+        clear_mock.assert_not_called()
+
+    # The same timer, not a cancelled-and-rescheduled replacement, is still due.
+    assert command_timers.active == [keepalive]
+    assert coordinator._passive_desired_power == 240
+    assert coordinator._passive_command_power == 240
+    assert coordinator.passive_power_state == state_before
+
+    # The countdown itself still refreshes normally afterwards.
+    mock_marstek_api.set_es_mode_passive.reset_mock()
+    mock_marstek_api.set_es_mode_passive.return_value = True
+    await keepalive.fire()
+    mock_marstek_api.set_es_mode_passive.assert_called_once_with(240)
+    assert command_timers.current.delay == 180
+
+
+async def test_manual_failure_without_passive_control_changes_nothing_else(
+    coordinator, mock_marstek_api
+):
+    """With no Passive target active, a failed Manual command is a pure no-op."""
+    mock_marstek_api.set_es_mode_manual.return_value = False
+    assert coordinator._passive_desired_power is None
+    assert coordinator.passive_power_state == "unknown"
+
+    with patch.object(coordinator, "_clear_passive_control") as clear_mock:
+        assert not await coordinator.async_set_manual_schedule(
+            time_num=0,
+            start_time="08:00",
+            end_time="20:00",
+            week_set=127,
+            power=300,
+            enable=1,
+        )
+        clear_mock.assert_not_called()
+
+    assert coordinator._passive_desired_power is None
+    assert coordinator._passive_command_power is None
+    assert coordinator.passive_power_state == "unknown"
+    assert coordinator._passive_keepalive_cancel is None
+    assert coordinator._passive_retry is None
+
+
+async def test_clear_passive_control_runs_only_after_manual_command_succeeds(
+    coordinator, mock_marstek_api
+):
+    """`_clear_passive_control` must never run before the API call returns."""
+    await coordinator.async_set_passive_power(240)
+    order = []
+    original_clear = coordinator._clear_passive_control
+
+    def record_clear():
+        order.append("clear_passive_control")
+        return original_clear()
+
+    def record_api_call(*_args, **_kwargs):
+        order.append("api_call")
+        return True
+
+    mock_marstek_api.set_es_mode_manual.side_effect = record_api_call
+    with patch.object(coordinator, "_clear_passive_control", side_effect=record_clear):
+        assert await coordinator.async_set_manual_schedule(
+            time_num=0,
+            start_time="08:00",
+            end_time="20:00",
+            week_set=127,
+            power=300,
+            enable=1,
+        )
+
+    assert order == ["api_call", "clear_passive_control"]
+
+
 async def test_selecting_passive_does_not_send_or_replace_target(
     coordinator, command_timers, mock_marstek_api, caplog
 ):

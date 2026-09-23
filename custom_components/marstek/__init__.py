@@ -487,6 +487,10 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         Every field is caller-supplied. Nothing here is invented or read back
         from an existing slot; the caller (the `marstek.set_operating_mode_manual`
         service) owns choosing a safe schedule.
+
+        Passive state is only torn down once the device has actually accepted
+        the Manual command. A failed attempt must not stop the countdown
+        keepalive for a Passive session the device is still physically in.
         """
         async with self._passive_command_lock:
             if self._identity_mismatch:
@@ -520,9 +524,16 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 )
                 return False
 
-            self._clear_passive_control()
+            # _async_send_mode_command's sequence/timing/last-command
+            # bookkeeping is shared with Passive's own retry/verification
+            # staleness and settle-window checks. Capture it so a failed
+            # attempt (which must not touch Passive state at all) can be
+            # undone rather than leaking into them.
+            sequence_before = self._passive_send_sequence
+            last_command_before = self._last_passive_command
+            last_send_at_before = self._passive_last_send_at
 
-            return await self._async_send_mode_command(
+            success = await self._async_send_mode_command(
                 mode=MODE_MANUAL,
                 source=source,
                 manual_params={
@@ -535,6 +546,17 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                     "manual_set": manual_set,
                 },
             )
+
+            if success:
+                # Only now has the device actually left Passive mode: discard
+                # the old mode's keepalive/retry and requested-power tracking.
+                self._clear_passive_control()
+            else:
+                self._passive_send_sequence = sequence_before
+                self._last_passive_command = last_command_before
+                self._passive_last_send_at = last_send_at_before
+
+            return success
 
     async def async_stop_passive_control(self) -> None:
         """Stop maintaining passive mode power."""

@@ -129,12 +129,13 @@ class MarstekAPI:
                     if type(response_id) is not int or response_id != request["id"]:
                         _LOGGER.debug(
                             "Ignored packet with mismatching request ID: "
-                            "host=%s port=%s method=%s request_id=%s response_id=%r",
+                            "host=%s port=%s method=%s request_id=%s response_id=%r response=%r",
                             self.host,
                             self.port,
                             method,
                             request["id"],
                             response_id,
+                            response,
                         )
                         continue
                     break

@@ -382,6 +382,41 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def async_set_passive_power(self, power: int) -> bool:
         """Set and maintain a desired real output for passive mode."""
+        desired = max(
+            self.calibration.command_min,
+            min(self.calibration.command_max, power),
+        )
+
+        if desired != power:
+            _LOGGER.warning(
+                "Marstek passive power request clamped: device=%s device_id=%s "
+                "requested=%sW limit=%sW..%sW",
+                self.entry.title,
+                self.device_id,
+                power,
+                self.calibration.command_min,
+                self.calibration.command_max,
+            )
+        # Do not restart Passive control when HA requests the target that is
+        # already being maintained. In particular, leave an existing retry or
+        # keepalive timer untouched.
+        #
+        # Only use this fast path while the command lock is free. If it is
+        # locked, another target may already be in flight or waiting to replace
+        # the currently recorded desired value.
+        if (
+            desired == self._passive_desired_power
+            and not self._passive_command_lock.locked()
+        ):
+            _LOGGER.debug(
+                "Marstek passive duplicate target ignored: device=%s "
+                "desired=%sW state=%s",
+                self.entry.title,
+                desired,
+                self._passive_power_state,
+            )
+            return self._passive_last_send_ok
+
         # Invalidate queued recovery before waiting for an in-flight command.
         # Its completion must not start recovery for the superseded target.
         self._passive_target_generation += 1
@@ -399,19 +434,6 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                     power,
                 )
                 return False
-            desired = max(
-                self.calibration.command_min, min(self.calibration.command_max, power)
-            )
-            if desired != power:
-                _LOGGER.warning(
-                    "Marstek passive power request clamped: device=%s device_id=%s "
-                    "requested=%sW limit=%sW..%sW",
-                    self.entry.title,
-                    self.device_id,
-                    power,
-                    self.calibration.command_min,
-                    self.calibration.command_max,
-                )
             self._passive_desired_power = desired
             self._passive_charge_recovery_blocked = False
             command, source = self.calibration.command_for(desired)

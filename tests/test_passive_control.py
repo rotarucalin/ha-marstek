@@ -34,6 +34,7 @@ from custom_components.marstek.const import (
 )
 from custom_components.marstek.number import MarstekPassivePowerNumber
 from custom_components.marstek.select import MarstekOperatingModeSelect
+from custom_components.marstek.sensor import MarstekPassivePowerStateSensor
 from custom_components.marstek.services import async_register_services
 
 pytestmark = pytest.mark.asyncio
@@ -420,7 +421,7 @@ async def test_manual_failure_without_passive_control_changes_nothing_else(
     """With no Passive target active, a failed Manual command is a pure no-op."""
     mock_marstek_api.set_es_mode_manual.return_value = False
     assert coordinator._passive_desired_power is None
-    assert coordinator.passive_power_state == "unknown"
+    assert coordinator.passive_power_state == "acknowledged"
 
     with patch.object(coordinator, "_clear_passive_control") as clear_mock:
         assert not await coordinator.async_set_manual_schedule(
@@ -435,7 +436,7 @@ async def test_manual_failure_without_passive_control_changes_nothing_else(
 
     assert coordinator._passive_desired_power is None
     assert coordinator._passive_command_power is None
-    assert coordinator.passive_power_state == "unknown"
+    assert coordinator.passive_power_state == "acknowledged"
     assert coordinator._passive_keepalive_cancel is None
     assert coordinator._passive_retry is None
 
@@ -1269,3 +1270,38 @@ async def test_slow_successful_retry_gets_full_settle_period_before_learning(
     await _settle_and_sample(coordinator, clock, actual=205, count=1)
     assert not coordinator.calibration.is_empty
     assert coordinator.command_power == 275
+
+
+@pytest.mark.parametrize("mode", ["Auto", "AI", "Manual", "Passive", None])
+async def test_startup_acknowledged_until_first_passive_send(
+    coordinator, mock_marstek_api, command_timers, mode
+):
+    """Idle startup polling must allow automations to send their first target."""
+    sensor = MarstekPassivePowerStateSensor(coordinator)
+    mock_marstek_api.get_es_mode.return_value = (
+        {"mode": mode, "ongrid_power": 0} if mode is not None else None
+    )
+    assert sensor.native_value == "acknowledged"
+    for _ in range(3):
+        await coordinator.async_refresh()
+        assert sensor.native_value == "acknowledged"
+    assert coordinator.desired_power is None
+    assert not command_timers.active
+    mock_marstek_api.set_es_mode_passive.assert_not_called()
+
+    assert await coordinator.async_set_passive_power(240)
+    assert sensor.native_value == "sent"
+
+
+async def test_restart_resets_passive_state_to_acknowledged(
+    coordinator, hass, marstek_entry, mock_marstek_api
+):
+    """A fresh coordinator starts ready even if the old command was unconfirmed."""
+    await coordinator.async_set_passive_power(240)
+    assert coordinator.passive_power_state == "sent"
+    await coordinator.async_stop_passive_control()
+
+    restarted = MarstekDataUpdateCoordinator(hass, mock_marstek_api, marstek_entry)
+    await restarted.async_refresh()
+    assert restarted.passive_power_state == "acknowledged"
+    assert restarted.desired_power is None

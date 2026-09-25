@@ -213,7 +213,9 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._passive_target_generation = 0
         self._passive_last_success_sequence = 0
         self._passive_command_lock = asyncio.Lock()
-        self._passive_power_state = PASSIVE_STATE_UNKNOWN
+        # Automations use acknowledged as their startup readiness signal, even
+        # outside Passive mode. Polling keeps it until the first command is sent.
+        self._passive_power_state = PASSIVE_STATE_ACKNOWLEDGED
         self._passive_send_sequence = 0
         self._passive_last_send_at = 0.0
         self._last_passive_command: dict | None = None

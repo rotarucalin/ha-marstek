@@ -393,3 +393,47 @@ async def test_failed_recovery_write_is_followed_by_measurement_without_an_inlin
     assert coordinator._passive_keepalive_cancel is None
     assert coordinator._passive_retry is not None
     assert coordinator._passive_retry.source == "verification_retry"
+
+
+@pytest.mark.parametrize(
+    "missing", [("es",), ("es_mode",), ("es", "es_mode")]
+)
+@pytest.mark.parametrize("missed_polls", [1, 7])
+async def test_fresh_reads_restore_acknowledged_after_communication_loss(
+    recovery, missing, missed_polls
+):
+    """Resume acknowledgement after a brief outage or expired cached readings."""
+    coordinator, api, _ = recovery
+    endpoints = {"es": api.get_es_status, "es_mode": api.get_es_mode}
+    readings = {key: endpoint.return_value for key, endpoint in endpoints.items()}
+    published = []
+    cancel = coordinator.async_add_listener(
+        lambda: published.append(coordinator.passive_power_state)
+    )
+    try:
+        assert coordinator.passive_power_state == "acknowledged"
+        for key in missing:
+            endpoints[key].return_value = None
+        for _ in range(missed_polls):
+            await coordinator.async_refresh()
+            assert coordinator.passive_power_state == "unknown"
+            assert published[-1] == "unknown"
+        if missed_polls > 6:
+            assert all(key not in coordinator.data for key in missing)
+
+        # One recovered endpoint is insufficient when both were lost.
+        if len(missing) == 2:
+            endpoints["es"].return_value = readings["es"]
+            await coordinator.async_refresh()
+            assert coordinator.passive_power_state == "unknown"
+            assert published[-1] == "unknown"
+
+        for key in missing:
+            endpoints[key].return_value = readings[key]
+        await coordinator.async_refresh()
+        assert coordinator.passive_power_state == "acknowledged"
+        assert published[-1] == "acknowledged"
+        assert all(coordinator._missing_cycles[key] == 0 for key in missing)
+        api.set_es_mode_passive.assert_not_called()
+    finally:
+        cancel()

@@ -1253,7 +1253,14 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             return self._last_good_data[key]
 
         result = await self.hass.async_add_executor_job(fetcher)
-
+        if key == "es" and result is not None:
+            _LOGGER.debug(
+                "Marstek ES data received: device=%s ongrid_power=%r data=%r",
+                self.entry.title,
+                result.get("ongrid_power"),
+                result,
+            )
+            
         if key == "em" and isinstance(result, dict) and result.get("ct_state") == 0:
             self._disabled_optional_sections.add(key)
             self._last_good_data.pop(key, None)

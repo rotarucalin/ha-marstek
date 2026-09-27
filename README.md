@@ -350,36 +350,62 @@ overlapping status queries. The 2.5-second interval is informed by
 it still needs verification on this device and firmware. Increasing the socket
 timeout alone does not solve requests that the firmware has already dropped.
 
-PV and Bluetooth are optional. If `PV.GetStatus` or `BLE.GetStatus` fails, the
-integration flags that section and stops querying it for the remainder of the
-session. Its sensors become unavailable; stale readings are not kept for a
-disabled section. Reload the Marstek integration or restart Home Assistant to
-probe these endpoints again after connecting PV or enabling Bluetooth. A
-transient failure also sets this flag, so reload if an installed component was
-temporarily unresponsive. A successful response, including zero PV power or an
-empty dictionary result, keeps the section in normal polling. Wi-Fi, battery,
-energy-system, and operating-mode queries continue retrying normally.
+The coordinator still wakes every 30 seconds, but only queries endpoints that
+are due. Deadlines start when a request finishes; the next coordinator update
+after that deadline performs the read. Skipped reads retain cached values.
 
-Wi-Fi status is diagnostic data and is polled on the first update, then on the
-first update at least five minutes after its last successful response. Its
-signal-strength sensor retains that reading between requests. Failed Wi-Fi
-requests retry each normal polling cycle, retaining cached data for up to six
-misses. Reloading the integration or restarting Home Assistant resets the
-Wi-Fi interval and queries it immediately. Battery, energy-system, and
-operating-mode data continue to be queried every cycle.
+| Endpoint | Normal interval | Failure-backoff cap |
+| --- | --- | --- |
+| `ES.GetStatus` | 30 seconds | 180 seconds |
+| `ES.GetMode` | 60 seconds | 300 seconds |
+| `Bat.GetStatus` | 60 seconds | 300 seconds |
+| `EM.GetStatus` | 60 seconds | 300 seconds |
+| `PV.GetStatus` | 60 seconds | 300 seconds |
+| `Wifi.GetStatus` | 300 seconds | 900 seconds |
+
+A failure doubles that endpoint's interval, with further failures doubling it
+again up to its cap. Success resets its failure count and normal interval.
+PV is queried only on supported models and now recovers automatically after
+timeouts. Intervals and caps can be overridden per coordinator through its
+`poll_intervals` and `backoff_caps` constructor mappings (section keys in
+`polling.py`); these are not Home Assistant UI options.
+
+Three different failing read endpoints within 120 seconds put that device's API
+health into `degraded`. Nonessential reads pause, while `ES.GetStatus` probes run
+no more frequently than every 120 seconds, subject to endpoint backoff. Commands,
+Passive retries, keepalives, and necessary verification remain available.
+Recovery requires at least three consecutive successful communications spanning
+at least 60 seconds; a failure restarts that recovery count. Both health
+transitions and scheduling changes are logged at DEBUG. Each device has its own
+health and scheduling state.
+
+When Passive is acknowledged, recent ES telemetry is valid, no recovery is
+pending, and the API is healthy, `ES.GetMode` slows to five minutes. Unknown
+verification, stale/failed ES telemetry, commands, or recovery remove this longer
+deadline, without bypassing endpoint failure backoff. Cached mode data never
+acknowledges a new command.
+
+Bluetooth retains its existing optional-endpoint behavior: a failed
+`BLE.GetStatus` disables it until integration reload or Home Assistant restart.
+Its cached values are discarded. Successful BLE reads remain on a 30-second
+interval. Reloading creates fresh schedules and immediately probes all eligible
+endpoints.
 
 Energy-meter polling (`EM.GetStatus`) also stops for the session after its first
 response explicitly reporting `ct_state: 0` (CT disconnected). CT Connected,
 Total Meter Power, and Phase A/B/C Power become unavailable immediately, and
 cached meter readings are discarded. Reload the integration or restart Home
 Assistant to probe the meter again after reconnecting the CT. Meter timeouts,
-API errors, and responses without `ct_state` continue normal retrying; only an
+API errors use endpoint backoff; only an
 explicit disconnected state disables this endpoint.
 
 Passive command failures retain their existing 15-second retry and successful
 commands their 180-second keepalive; the transport adds no immediate retries.
 These timers run after the command completes; a command can also wait for an
-in-flight request and the quiet interval. Poll cycles take longer with pacing.
+in-flight request and the quiet interval. Pending commands take precedence over
+queued reads, including commands waiting behind another command. An active UDP
+exchange finishes before the command starts; requests never overlap. Poll cycles
+take longer with pacing.
 The gap reduces request pressure but cannot guarantee that all device-side
 failures disappear. The gate is per client and cannot coordinate traffic from
 other integrations, apps, or API clients.
@@ -389,8 +415,8 @@ the updated code. For subsequent optional-endpoint reprobes, an integration
 reload is sufficient. With debug logging enabled for `custom_components.marstek`,
 check fresh logs for:
 
-- At most one failed `BLE.GetStatus` and one failed `PV.GetStatus` request per
-  coordinator lifetime, each followed by the section's skip message.
+- At most one failed `BLE.GetStatus` request per coordinator lifetime, followed
+  by its skip message; failed PV reads instead back off and retry.
 - An energy-meter skip message after the CT reports disconnected, followed by
   no further `EM.GetStatus` queries until reload or restart.
 - Continued essential polling and recovery after temporary timeouts.
@@ -416,17 +442,19 @@ and the 2.5-second gap apply regardless of logging verbosity.
 3. Reload the integration from the UI
 4. Check if Open API is still enabled
 
-**Note on data caching**: Essential data sections retain their last known good values for six missed polling cycles, then become unavailable until a successful response. The time this spans depends on request latency and pacing as well as the 30-second polling interval. Failed optional PV/Bluetooth sections and an explicitly disconnected energy meter immediately become unavailable and remain disabled until integration reload or Home Assistant restart.
+**Note on data caching**: Sections retain their last known good values for six actual failed reads, then become unavailable until a successful response. Intentional interval/backoff skips do not count as failures. The elapsed time depends on endpoint intervals, backoff, request latency, and pacing. Failed Bluetooth and an explicitly disconnected energy meter immediately become unavailable until integration reload or Home Assistant restart.
 
 ### Enable Debug Logging
 
 Passive control acknowledges output only when fresh `ES.GetStatus` and
 `ES.GetMode` power readings agree. The energy-system status remains the measured
 output used by both verification and calibration. Cached, missing, invalid, or
-conflicting readings cannot acknowledge a command or enter calibration.
+conflicting readings cannot acknowledge a command or enter calibration. Between
+scheduled mode reads, matching fresh ES output can maintain an existing
+acknowledgement; this does not acknowledge a new command or add calibration samples.
 
 An unexpected near-zero reading while charging, or disagreement between the
-endpoints, triggers one follow-up round through the existing 2.5-second request
+endpoints, triggers one necessary follow-up round through the existing 2.5-second request
 gate. A confirmed charging interruption resends the maintained compensated
 command only with fresh charging permission and SOC below 100%. Unknown or denied
 permission pauses automatic maintenance until fresh telemetry permits recovery;

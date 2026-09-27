@@ -251,14 +251,19 @@ def test_default_capabilities_label():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reported", PV_MODELS)
-async def test_pv_models_are_polled_for_pv(coordinator, mock_marstek_api, reported):
-    """Venus A/D keep querying PV.GetStatus every cycle."""
+async def test_pv_models_are_polled_for_pv(
+    coordinator, mock_marstek_api, reported, monkeypatch
+):
+    """Venus A/D keep querying PV.GetStatus when its interval is due."""
     mock_marstek_api.get_device_info.return_value = {
         "device": reported,
         "ble_mac": "AA:BB:CC:DD:EE:01",
     }
     mock_marstek_api.get_pv_status.return_value = {"pv1_power": 120}
     for cycle in range(3):
+        monkeypatch.setattr(
+            "custom_components.marstek.monotonic", lambda cycle=cycle: 1000 + cycle * 60
+        )
         data = await coordinator._async_update_data()
         assert data["pv"] == {"pv1_power": 120}
         assert mock_marstek_api.get_pv_status.call_count == cycle + 1
@@ -405,7 +410,9 @@ async def test_mode_select_offers_the_models_modes(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reported", ["VenusA", "VenusC", "VenusD", "VenusE", "VNSEM-0"])
+@pytest.mark.parametrize(
+    "reported", ["VenusA", "VenusC", "VenusD", "VenusE", "VNSEM-0"]
+)
 async def test_selecting_manual_never_sends_a_schedule(
     coordinator, mock_marstek_api, reported
 ):
@@ -424,7 +431,9 @@ async def test_selecting_manual_never_sends_a_schedule(
 
 
 @pytest.mark.asyncio
-async def test_manual_schedule_sends_manual_set_on_e_mini(coordinator, mock_marstek_api):
+async def test_manual_schedule_sends_manual_set_on_e_mini(
+    coordinator, mock_marstek_api
+):
     """The E mini needs manual_set to give the slot a direction."""
     mock_marstek_api.get_device_info.return_value = {
         "device": "VNSEM-0",
@@ -508,6 +517,8 @@ async def test_manual_schedule_does_not_disturb_active_passive_control(
         enable=1,
     )
     assert coordinator._passive_desired_power == 240
+
+    await coordinator.async_stop_passive_control()
 
 
 @pytest.mark.parametrize(

@@ -60,6 +60,15 @@ async def recovery(hass, marstek_entry, mock_marstek_api, monkeypatch, caplog, r
     monkeypatch.setattr(coordinator, "_async_wait_passive_settle", settle)
     mock_marstek_api.reset_mock()
     caplog.clear()
+    refresh = coordinator.async_refresh
+
+    async def refresh_when_due():
+        # These regressions exercise recovery with a full, fresh observation.
+        # Shorter cadence / intentionally cached observations have dedicated tests.
+        clock.now += 300
+        await refresh()
+
+    monkeypatch.setattr(coordinator, "async_refresh", refresh_when_due)
     yield coordinator, mock_marstek_api, clock
     await coordinator.async_stop_passive_control()
 
@@ -367,6 +376,8 @@ async def test_pending_new_command_gets_settling_time_before_zero_confirmation(
     api.get_es_status.side_effect = [status(0), status(-768)]
     api.get_es_mode.side_effect = [mode(0), mode(-768)]
     waits = []
+    # The following scheduled poll observes a command still inside its settle window.
+    coordinator._passive_last_send_at = clock.now + 300
 
     async def settle():
         waits.append(clock.now)
@@ -395,9 +406,7 @@ async def test_failed_recovery_write_is_followed_by_measurement_without_an_inlin
     assert coordinator._passive_retry.source == "verification_retry"
 
 
-@pytest.mark.parametrize(
-    "missing", [("es",), ("es_mode",), ("es", "es_mode")]
-)
+@pytest.mark.parametrize("missing", [("es",), ("es_mode",), ("es", "es_mode")])
 @pytest.mark.parametrize("missed_polls", [1, 7])
 async def test_fresh_reads_restore_acknowledged_after_communication_loss(
     recovery, missing, missed_polls

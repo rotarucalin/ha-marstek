@@ -1,4 +1,4 @@
-"""Optional endpoint failures are latched only for the coordinator's lifetime."""
+"""BLE/CT latches and six-failure caching across scheduled endpoint reads."""
 
 import logging
 
@@ -6,22 +6,40 @@ import pytest
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import UpdateFailed
 
-from custom_components.marstek import (
-    WIFI_POLL_INTERVAL_SECONDS,
-    MarstekDataUpdateCoordinator,
-)
+from custom_components.marstek import MarstekDataUpdateCoordinator
 from custom_components.marstek.const import DOMAIN
 
 pytestmark = pytest.mark.asyncio
 
-OPTIONAL = {"ble": "get_ble_status", "pv": "get_pv_status"}
+OPTIONAL = {"ble": "get_ble_status"}
 ESSENTIAL = {
+    "pv": "get_pv_status",
     "wifi": "get_wifi_status",
     "battery": "get_battery_status",
     "es": "get_es_status",
     "es_mode": "get_es_mode",
     "em": "get_em_status",
 }
+
+
+@pytest.fixture(autouse=True)
+def scheduled_polls(monkeypatch):
+    """These cache/latch tests advance past all normal and backoff deadlines.
+
+    Dedicated scheduling tests cover intermediate polls and intentional skips.
+    """
+    now = 1000.0
+    monkeypatch.setattr("custom_components.marstek.monotonic", lambda: now)
+    update = MarstekDataUpdateCoordinator._async_update_data
+
+    async def poll_when_due(coordinator):
+        nonlocal now
+        now += 900
+        return await update(coordinator)
+
+    monkeypatch.setattr(
+        MarstekDataUpdateCoordinator, "_async_update_data", poll_when_due
+    )
 
 
 @pytest.fixture
@@ -36,7 +54,7 @@ async def test_first_optional_failure_stops_queries(
 ):
     """Only the failed optional endpoint stops; all other sections keep polling."""
     caplog.set_level(logging.INFO, logger="custom_components.marstek")
-    fetcher = getattr(mock_marstek_api, OPTIONAL[section])
+    fetcher = getattr(mock_marstek_api, {**OPTIONAL, **ESSENTIAL}[section])
     fetcher.return_value = None
     for cycle in range(10):
         data = await coordinator._async_update_data()
@@ -47,10 +65,8 @@ async def test_first_optional_failure_stops_queries(
         assert fetcher.call_count == 1
         assert coordinator._disabled_optional_sections == {section}
         for method in ESSENTIAL.values():
-            expected = 1 if method == "get_wifi_status" else cycle + 1
+            expected = cycle + 1
             assert getattr(mock_marstek_api, method).call_count == expected
-    other_section = ({"ble", "pv"} - {section}).pop()
-    assert getattr(mock_marstek_api, OPTIONAL[other_section]).call_count == 10
     assert caplog.text.count("skipping it until integration reload") == 1
 
 
@@ -58,7 +74,7 @@ async def test_first_optional_failure_stops_queries(
 async def test_optional_failure_discards_last_good_reading(
     coordinator, mock_marstek_api, section
 ):
-    fetcher = getattr(mock_marstek_api, OPTIONAL[section])
+    fetcher = getattr(mock_marstek_api, {**OPTIONAL, **ESSENTIAL}[section])
     fetcher.return_value = {"value": 12}
     assert (await coordinator._async_update_data())[section] == {"value": 12}
     fetcher.return_value = None
@@ -80,7 +96,7 @@ async def test_optional_failure_discards_last_good_reading(
 async def test_successful_optional_responses_remain_in_polling(
     coordinator, mock_marstek_api, section, response
 ):
-    fetcher = getattr(mock_marstek_api, OPTIONAL[section])
+    fetcher = getattr(mock_marstek_api, {**OPTIONAL, **ESSENTIAL}[section])
     fetcher.return_value = response
     for _ in range(3):
         assert (await coordinator._async_update_data())[section] == response
@@ -93,12 +109,9 @@ async def test_essential_endpoint_keeps_retrying_and_recovers(
     coordinator, mock_marstek_api, monkeypatch, section
 ):
     """Essential data keeps its six-cycle cache and can recover after expiry."""
-    poll_time = 1000.0
-    monkeypatch.setattr("custom_components.marstek.monotonic", lambda: poll_time)
     for method in OPTIONAL.values():
         getattr(mock_marstek_api, method).return_value = None
     original = (await coordinator._async_update_data())[section]
-    poll_time += WIFI_POLL_INTERVAL_SECONDS
     fetcher = getattr(mock_marstek_api, ESSENTIAL[section])
     fetcher.return_value = None
     for misses in range(1, 8):
@@ -107,7 +120,7 @@ async def test_essential_endpoint_keeps_retrying_and_recovers(
             assert data[section] == original
         else:
             assert section not in data
-        assert coordinator._disabled_optional_sections == {"ble", "pv"}
+        assert coordinator._disabled_optional_sections == {"ble"}
         assert fetcher.call_count == misses + 1
     fetcher.return_value = original
     assert (await coordinator._async_update_data())[section] == original
@@ -125,12 +138,16 @@ async def test_total_outage_does_not_disable_essential_recovery(
     for _ in range(2):
         with pytest.raises(UpdateFailed, match="No Marstek data received"):
             await coordinator._async_update_data()
+    assert coordinator._polling.degraded
     for method in ESSENTIAL.values():
-        assert getattr(mock_marstek_api, method).call_count == 2
         getattr(mock_marstek_api, method).return_value = {}
-    assert set(await coordinator._async_update_data()) == {"device_info", *ESSENTIAL}
-    for method in OPTIONAL.values():
-        assert getattr(mock_marstek_api, method).call_count == 1
+    # Three spaced ES probes close the breaker, then the next cycle restores
+    # endpoints which preceded ES in the interrupted update.
+    for _ in range(4):
+        data = await coordinator._async_update_data()
+    assert not coordinator._polling.degraded
+    assert set(data) == {"device_info", *ESSENTIAL}
+    assert mock_marstek_api.get_ble_status.call_count == 1
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")
@@ -158,8 +175,8 @@ async def test_reload_reprobes_sections_and_restores_entity_availability(
         getattr(mock_marstek_api, method).return_value = None
     await coordinator.async_refresh()
     await hass.async_block_till_done()
-    assert coordinator._disabled_optional_sections == {"ble", "pv"}
-    assert hass.states.get(pv_id).state == "unavailable"
+    assert coordinator._disabled_optional_sections == {"ble"}
+    assert hass.states.get(pv_id).state == "0"
     assert hass.states.get(ble_id).state == "unavailable"
 
     mock_marstek_api.get_pv_status.return_value = {"pv1_power": 0}
@@ -209,7 +226,7 @@ async def test_ct_disconnection_stops_meter_queries(
         for key, method in {**ESSENTIAL, **OPTIONAL}.items():
             if key != "em":
                 assert key in data
-                expected = 1 if key == "wifi" else preceding_calls + cycle + 1
+                expected = preceding_calls + cycle + 1
                 assert getattr(mock_marstek_api, method).call_count == expected
     assert caplog.text.count("energy meter reports CT disconnected") == 1
 

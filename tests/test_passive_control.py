@@ -899,7 +899,8 @@ async def test_validity_gate_blocks_learning(
 
     if gate == "failed_send":
         mock_marstek_api.set_es_mode_passive.return_value = False
-        assert not await coordinator.async_set_passive_power(desired)
+        await command_timers.current.fire()
+        assert not coordinator._passive_last_send_ok
 
     if gate != "not_settled":
         clock.advance(PASSIVE_SETTLE_SECONDS + 1)

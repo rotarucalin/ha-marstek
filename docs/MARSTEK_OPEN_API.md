@@ -242,8 +242,9 @@ hex serial, lowercase, drop non-alphanumerics, then match by longest prefix so
 
 ## 6. Things the specification does not tell you
 
-- No rate limit is documented. Polling every 30 seconds with paced sequential
-  requests is what this integration settled on.
+- No rate limit is documented. This integration checks endpoint deadlines every
+  30 seconds, with paced sequential reads, per-endpoint intervals/backoff, and
+  device-local API-health throttling (see the README).
 - The device answers one request at a time. Concurrent UDP requests are not
   documented as supported.
 - Passive mode's `cd_time` means the commanded power expires. Anything that

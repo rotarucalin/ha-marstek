@@ -1,4 +1,4 @@
-"""Wi-Fi diagnostics poll slowly after success and recover at normal cadence."""
+"""Wi-Fi diagnostics use long normal and failure-backoff intervals."""
 
 from unittest.mock import Mock
 
@@ -49,27 +49,28 @@ async def test_wifi_waits_five_minutes_while_other_endpoints_keep_polling(
         "get_es_mode",
         "get_em_status",
     ):
-        assert getattr(mock_marstek_api, method).call_count == 8
+        expected = 7 if method in {"get_ble_status", "get_es_status"} else 6
+        assert getattr(mock_marstek_api, method).call_count == expected
 
 
-async def test_initial_wifi_failures_retry_each_cycle_until_success(
+async def test_initial_wifi_failures_back_off_until_success(
     coordinator, mock_marstek_api, wifi_clock
 ):
     mock_marstek_api.get_wifi_status.side_effect = [None, None, {"rssi": -60}]
-    for seconds in (0, 30):
+    for seconds in (0, 600):
         wifi_clock.return_value = 1000 + seconds
         assert "wifi" not in await coordinator._async_update_data()
-    wifi_clock.return_value = 1060.0
+    wifi_clock.return_value = 2500.0
     assert (await coordinator._async_update_data())["wifi"] == {"rssi": -60}
     assert mock_marstek_api.get_wifi_status.call_count == 3
     assert "wifi" not in coordinator._disabled_optional_sections
 
     mock_marstek_api.get_wifi_status.side_effect = None
     mock_marstek_api.get_wifi_status.return_value = {"rssi": -50}
-    wifi_clock.return_value = 1359.999
+    wifi_clock.return_value = 2799.999
     assert (await coordinator._async_update_data())["wifi"] == {"rssi": -60}
     assert mock_marstek_api.get_wifi_status.call_count == 3
-    wifi_clock.return_value = 1360.0
+    wifi_clock.return_value = 2800.0
     assert (await coordinator._async_update_data())["wifi"] == {"rssi": -50}
     assert mock_marstek_api.get_wifi_status.call_count == 4
 

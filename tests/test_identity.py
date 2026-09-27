@@ -300,7 +300,8 @@ async def test_identity_mismatch_cancels_in_flight_command_keepalive(
         await command_started.wait()
         refresh = asyncio.create_task(coordinator.async_refresh())
         try:
-            await identity_received.wait()
+            await asyncio.sleep(0)
+            assert not identity_received.is_set()  # UDP reads wait for the command.
             assert not refresh.done()
         finally:
             finish_command.set()

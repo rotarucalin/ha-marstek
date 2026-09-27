@@ -51,7 +51,8 @@ from .const import (
 from .identity import CONF_DEVICE_INFO, device_metadata, normalize_mac
 from .marstek_api import MarstekAPI
 from .passive_calibration import PassiveCalibration, bucket_center, direction_of
-from .passive_telemetry import PassiveTelemetry
+from .passive_telemetry import PassiveTelemetry, numeric
+from .polling import ES_FRESH_SECONDS, CommandPriorityGate, PollingPolicy
 from .registry import async_repair_registry
 from .services import async_register_services
 
@@ -68,9 +69,8 @@ PLATFORMS: list[Platform] = [
 ]
 
 SCAN_INTERVAL = timedelta(seconds=30)
-WIFI_POLL_INTERVAL_SECONDS = 300
 # EM is disabled only on an explicit CT disconnection, not on request failure.
-OPTIONAL_SECTIONS = frozenset({"ble", "pv"})
+OPTIONAL_SECTIONS = frozenset({"ble"})
 PASSIVE_POWER_KEEPALIVE_SECONDS = 180
 PASSIVE_POWER_RETRY_SECONDS = 15
 PASSIVE_POWER_TOLERANCE = 0.20
@@ -157,6 +157,8 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         store: Store | None = None,
         calibration_data: object = None,
         max_passive_power: int = DEFAULT_MAX_PASSIVE_POWER,
+        poll_intervals: dict[str, float] | None = None,
+        backoff_caps: dict[str, float] | None = None,
     ) -> None:
         """Initialize."""
         self.api = api
@@ -191,8 +193,14 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._capabilities = resolve_capabilities(self.device_info.get("device"))
         self._last_good_data: dict = {}
         self._missing_cycles: dict[str, int] = {}
-        self._next_wifi_poll_at = 0.0
-        # Stop probing failed PV/Bluetooth or an explicitly disconnected CT.
+        self._polling = PollingPolicy(
+            entry.title, intervals=poll_intervals, backoff_caps=backoff_caps
+        )
+        self._io_gate = CommandPriorityGate()
+        self._fresh_sections: set[str] = set()
+        self._mode_verification_required = False
+        self._es_telemetry_stale = False
+        # Stop probing failed Bluetooth or an explicitly disconnected CT.
         # Probe again when a fresh coordinator is created on startup/reload.
         self._disabled_optional_sections: set[str] = set()
         # The requested real output, the value actually sent, and the samples
@@ -286,7 +294,14 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         """Refresh metadata, retrying misses without changing a saved identity."""
         if self._device_info_fetched:
             return
-        info = await self.hass.async_add_executor_job(self.api.get_device_info)
+        if (
+            self.device_id is not None
+            and not self._identity_mismatch
+            and self._polling.degraded
+        ):
+            return
+        async with self._io_gate.slot():
+            info = await self._async_device_job(self.api.get_device_info)
         reported_id = (
             normalize_mac(info.get("ble_mac")) if isinstance(info, dict) else None
         )
@@ -370,6 +385,8 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         if state == self._passive_power_state:
             return
         self._passive_power_state = state
+        if state != PASSIVE_STATE_ACKNOWLEDGED:
+            self._require_mode_verification()
         # A poll publishes its data and verification state together. In particular,
         # recovery must not notify listeners with the pre-command zero reading.
         if not self._passive_poll_active:
@@ -425,7 +442,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         generation = self._passive_target_generation
         self._cancel_passive_retry()
         self._cancel_passive_keepalive()
-        async with self._passive_command_lock:
+        async with self._io_gate.control(), self._passive_command_lock:
             if generation != self._passive_target_generation:
                 return False
             if self._identity_mismatch:
@@ -456,7 +473,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         `async_set_manual_schedule` (the `marstek.set_operating_mode_manual`
         service) instead, which always requires the caller to state a slot.
         """
-        async with self._passive_command_lock:
+        async with self._io_gate.control(), self._passive_command_lock:
             if self._identity_mismatch:
                 _LOGGER.warning(
                     "Marstek command blocked: device=%s source=%s mode=%s "
@@ -516,7 +533,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         the Manual command. A failed attempt must not stop the countdown
         keepalive for a Passive session the device is still physically in.
         """
-        async with self._passive_command_lock:
+        async with self._io_gate.control(), self._passive_command_lock:
             if self._identity_mismatch:
                 _LOGGER.warning(
                     "Marstek command blocked: device=%s source=%s mode=%s "
@@ -584,7 +601,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def async_stop_passive_control(self) -> None:
         """Stop maintaining passive mode power."""
-        async with self._passive_command_lock:
+        async with self._io_gate.control(), self._passive_command_lock:
             self._clear_passive_control()
 
     async def _async_send_mode_command(
@@ -597,7 +614,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
     ) -> bool:
         """Log and send a mode command using the API's set_result semantics.
 
-        A successful request still needs separate confirmation from ES.GetMode.
+        A successful request still needs fresh ES telemetry confirmation.
         Callers serialize commands with the passive command lock.
         """
         command: Callable[..., bool]
@@ -658,13 +675,16 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             "success": None,
         }
         try:
-            success = bool(await self.hass.async_add_executor_job(command, *args))
+            async with self._io_gate.slot(command=True):
+                success = bool(await self._async_device_job(command, *args))
         except Exception as err:  # noqa: BLE001 - Keep maintenance alive on API failure.
             success = False
             error = f"{type(err).__name__}: {err}"
 
         self._passive_last_send_at = monotonic()
         self._last_passive_command["success"] = success
+        self._polling.communication("ES.SetMode", success, monotonic())
+        self._require_mode_verification()
 
         if success:
             if source != "keepalive":
@@ -749,6 +769,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         """Schedule just one retry, preserving the origin across failures."""
         if self._passive_retry is not None:
             return
+        self._require_mode_verification()
         retry = PassiveCommandRetry(
             self._passive_send_sequence,
             self._passive_desired_power,
@@ -776,7 +797,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def _async_retry_passive_power(self, retry: PassiveCommandRetry) -> None:
         """Only the active failed command may consume the recovery slot."""
-        async with self._passive_command_lock:
+        async with self._io_gate.control(), self._passive_command_lock:
             if (
                 retry is not self._passive_retry
                 or retry.sequence != self._passive_send_sequence
@@ -844,7 +865,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         """Resend the passive command power when its keepalive is due."""
         if self._passive_recovery_pending("keepalive"):
             return
-        async with self._passive_command_lock:
+        async with self._io_gate.control(), self._passive_command_lock:
             if self._passive_recovery_pending("keepalive"):
                 return
             if (
@@ -959,7 +980,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         generation = self._passive_target_generation
         if command_sequence is None:
             command_sequence = self._passive_send_sequence
-        async with self._passive_command_lock:
+        async with self._io_gate.control(), self._passive_command_lock:
             if self._passive_recovery_pending("verification"):
                 return False
             if self._passive_desired_power is None:
@@ -1084,11 +1105,12 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         ):
             # Do not reuse pre-command readings, even when the follow-up fails.
             data.pop(key, None)
-            result = await self._fetch_section(key, fetcher)
-            if self._missing_cycles.get(key) == 0 and result is not None:
+            result = await self._fetch_section(key, fetcher, verification=True)
+            if key in self._fresh_sections and result is not None:
                 data[key] = result
                 fresh.add(key)
             else:
+                # Never publish the pre-command snapshot after a recovery write.
                 self._last_good_data.pop(key, None)
         return sequence, PassiveTelemetry(
             data.get("es_mode", {}),
@@ -1117,7 +1139,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         fresh = frozenset(
             key
             for key in ("battery", "es", "es_mode")
-            if key in data and self._missing_cycles.get(key) == 0
+            if key in data and key in self._fresh_sections
         )
         telemetry = PassiveTelemetry(
             data.get("es_mode", {}),
@@ -1128,10 +1150,24 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         if sequence != self._passive_send_sequence:
             self._discard_superseded_passive_readings(data)
             return
+        if "es_mode" not in fresh and self._passive_is_stable():
+            # Keep an existing acknowledgement using fresh ES status only.
+            # This path cannot acknowledge a newly issued command or learn.
+            actual = telemetry.power("es")
+            if actual is None:
+                return
+            tolerance = max(
+                abs(self._passive_desired_power) * PASSIVE_POWER_TOLERANCE,
+                PASSIVE_POWER_ZERO_TOLERANCE,
+            )
+            if abs(actual - self._passive_desired_power) <= tolerance:
+                return
+            self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
         suspect = telemetry.disagreement or telemetry.unexpected_zero(
             self._passive_desired_power
         )
-        if suspect:
+        # Missing/failed reads must never cause extra confirmation traffic.
+        if suspect and "es" in fresh:
             self._passive_samples.clear()
             self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
             self._log_passive_observation("suspected_interruption", telemetry)
@@ -1139,6 +1175,14 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 await self._async_wait_passive_settle()
             sequence, telemetry = await self._async_read_passive_telemetry(data)
             self._log_passive_observation("confirmation", telemetry)
+        elif suspect:
+            self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
+            return
+
+        if not fresh:
+            if not self._passive_is_stable():
+                self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
+            return
 
         sent = await self._async_verify_passive_power(
             telemetry.mode,
@@ -1242,19 +1286,96 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 self.calibration_snapshot, PASSIVE_SAVE_DELAY_SECONDS
             )
 
-    async def _fetch_section(self, key: str, fetcher):
+    async def _async_device_job(self, function, *args):
+        """Hold admission until executor I/O ends, including on cancellation."""
+        job = asyncio.ensure_future(self.hass.async_add_executor_job(function, *args))
+        try:
+            return await asyncio.shield(job)
+        except asyncio.CancelledError:
+            # Cancelling an executor future cannot stop its running UDP request.
+            # Drain it before releasing the scheduler slot to the next request.
+            while not job.done():
+                try:
+                    await asyncio.shield(job)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:  # noqa: BLE001 - Preserve the caller's cancellation.
+                    break
+            if not job.cancelled():
+                job.exception()
+            raise
+
+    def _require_mode_verification(self) -> None:
+        self._mode_verification_required = True
+        self._polling.require_mode(monotonic())
+
+    def _check_es_freshness(self) -> None:
+        """An ES outage requests verification once, not on every skipped poll."""
+        state = self._polling.sections["es"]
+        stale = (
+            state.last_success is None
+            or state.consecutive_failures > 0
+            or monotonic() - state.last_success > ES_FRESH_SECONDS
+            or numeric(self._last_good_data.get("es", {}).get("ongrid_power")) is None
+        )
+        if stale and not self._es_telemetry_stale:
+            self._require_mode_verification()
+        self._es_telemetry_stale = stale
+
+    def _passive_is_stable(self) -> bool:
+        state = self._polling.sections["es"]
+        return (
+            self._passive_desired_power is not None
+            and self._passive_power_state == PASSIVE_STATE_ACKNOWLEDGED
+            and not self._passive_command_in_flight
+            and self._passive_retry is None
+            and not self._mode_verification_required
+            and not self._polling.degraded
+            and not self._polling.sections["es_mode"].consecutive_failures
+            and not state.consecutive_failures
+            and state.last_success is not None
+            and monotonic() - state.last_success <= ES_FRESH_SECONDS
+            and numeric(self._last_good_data.get("es", {}).get("ongrid_power"))
+            is not None
+        )
+
+    def _cached_section(self, key: str):
+        """Keep the existing six-failure allowance; skips are not failures."""
+        if self._missing_cycles.get(key, 0) <= 6:
+            return self._last_good_data.get(key)
+        return None
+
+    async def _fetch_section(self, key: str, fetcher, *, verification: bool = False):
         """Fetch one section and track consecutive misses."""
         if key in self._disabled_optional_sections:
             return None
-
-        if (
-            key == "wifi"
-            and key in self._last_good_data
-            and monotonic() < self._next_wifi_poll_at
-        ):
-            return self._last_good_data[key]
-
-        result = await self.hass.async_add_executor_job(fetcher)
+        self._fresh_sections.discard(key)
+        if key == "es_mode":
+            self._polling.mode_interval(self._passive_is_stable(), monotonic())
+            if self._mode_verification_required:
+                self._polling.require_mode(monotonic())
+        critical = verification or (
+            key == "es_mode" and self._mode_verification_required
+        )
+        # Explicit verification may bypass a successful read's interval. Merely
+        # needing mode verification bypasses global throttling, not failure backoff.
+        if not self._polling.due(key, monotonic(), verification=critical):
+            return self._cached_section(key)
+        if self._io_gate.pending_commands or self._io_gate.pending_controls:
+            _LOGGER.debug(
+                "Marstek poll deferred: device=%s endpoint=%s skip_reason=command pending",
+                self.entry.title,
+                key,
+            )
+        async with self._io_gate.slot():
+            if not self._polling.due(key, monotonic(), verification=critical):
+                return self._cached_section(key)
+            try:
+                result = await self._async_device_job(fetcher)
+            except Exception as err:  # noqa: BLE001 - Treat raised API errors like timeouts.
+                _LOGGER.debug("Marstek section %s failed: %s", key, err)
+                result = None
+            self._polling.record(key, result is not None, monotonic())
         if key == "es" and isinstance(result, dict):
             _LOGGER.debug(
                 "Marstek ES data received: device=%s ongrid_power=%r data=%r",
@@ -1275,14 +1396,18 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             return None
 
         if result is not None:
+            self._fresh_sections.add(key)
+            if key == "es_mode":
+                self._mode_verification_required = False
             self._missing_cycles[key] = 0
             self._last_good_data[key] = result
-            if key == "wifi":
-                # Only success delays the next poll; failures retry next cycle.
-                self._next_wifi_poll_at = monotonic() + WIFI_POLL_INTERVAL_SECONDS
+            if key == "es" and self._passive_desired_power is not None:
+                self._check_es_freshness()
             return result
 
         self._missing_cycles[key] = self._missing_cycles.get(key, 0) + 1
+        if key == "es" and self._passive_desired_power is not None:
+            self._check_es_freshness()
         if key in OPTIONAL_SECTIONS:
             self._disabled_optional_sections.add(key)
             self._last_good_data.pop(key, None)
@@ -1302,7 +1427,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             use_cached,
         )
 
-        # Keep essential data for six missed cycles; pacing/timeouts extend each cycle.
+        # Keep data for six actual failed reads; intentional skips do not count.
         if use_cached:
             return self._last_good_data[key]
 
@@ -1311,19 +1436,15 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self):
         """Update data via library."""
         self._passive_poll_active = True
+        self._fresh_sections.clear()
         try:
             data = {}
 
+            if self._passive_desired_power is not None:
+                self._check_es_freshness()
+
             await self._async_refresh_device_info()
             data["device_info"] = dict(self.device_info)
-
-            wifi_status = await self._fetch_section("wifi", self.api.get_wifi_status)
-            if wifi_status is not None:
-                data["wifi"] = wifi_status
-
-            ble_status = await self._fetch_section("ble", self.api.get_ble_status)
-            if ble_status is not None:
-                data["ble"] = ble_status
 
             passive_sequence = self._passive_send_sequence
             bat_status = await self._fetch_section(
@@ -1331,13 +1452,6 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             )
             if bat_status is not None:
                 data["battery"] = bat_status
-
-            # Only Venus A/D answer PV.GetStatus; the rest would time out here
-            # every cycle until the optional-section probe gave up.
-            if self.capabilities.supports_pv:
-                pv_status = await self._fetch_section("pv", self.api.get_pv_status)
-                if pv_status is not None:
-                    data["pv"] = pv_status
 
             es_status = await self._fetch_section("es", self.api.get_es_status)
             if es_status is not None:
@@ -1352,6 +1466,18 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             em_status = await self._fetch_section("em", self.api.get_em_status)
             if em_status is not None:
                 data["em"] = em_status
+
+            # Diagnostics follow control telemetry and any bounded recovery.
+            for key, fetcher in (
+                ("wifi", self.api.get_wifi_status),
+                ("ble", self.api.get_ble_status),
+                ("pv", self.api.get_pv_status),
+            ):
+                if key == "pv" and not self.capabilities.supports_pv:
+                    continue
+                result = await self._fetch_section(key, fetcher)
+                if result is not None:
+                    data[key] = result
 
             # If absolutely nothing useful came back, treat this as a real update failure
             non_device_keys = [k for k in data if k != "device_info"]

@@ -93,7 +93,7 @@ async def test_partial_channels(hass, marstek_entry, mock_marstek_api, pv_status
 
 @pytest.mark.parametrize("missing", ["omitted", "null"])
 async def test_channel_data_disappears_and_recovers(
-    hass, marstek_entry, mock_marstek_api, pv_status, missing
+    hass, marstek_entry, mock_marstek_api, pv_status, missing, monkeypatch
 ):
     """Availability follows each reading on refresh without stale or zero data."""
     coordinator = await setup_pv(hass, marstek_entry, mock_marstek_api, pv_status)
@@ -114,6 +114,8 @@ async def test_channel_data_disappears_and_recovers(
         else:
             payload.pop(key)
     mock_marstek_api.get_pv_status.return_value = payload
+    poll_time = coordinator._polling.sections["pv"].next_poll
+    monkeypatch.setattr("custom_components.marstek.monotonic", lambda: poll_time)
     await coordinator.async_refresh()
     await hass.async_block_till_done()
     for key in missing_keys:
@@ -123,6 +125,7 @@ async def test_channel_data_disappears_and_recovers(
     assert float(sensor_state(hass, marstek_entry, "pv_power").state) == 257.5
 
     mock_marstek_api.get_pv_status.return_value = pv_status
+    poll_time += 60
     await coordinator.async_refresh()
     await hass.async_block_till_done()
     assert sensor_state(hass, marstek_entry, "pv1_power").state == "120"

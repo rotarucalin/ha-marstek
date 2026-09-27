@@ -730,6 +730,12 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             self._schedule_passive_keepalive(
                 delay=PASSIVE_POWER_KEEPALIVE_SECONDS, source="keepalive"
             )
+            if source == "keepalive":
+                telemetry = self._cached_passive_output()
+                if telemetry.power("es") is None:
+                    outcome_state = PASSIVE_STATE_UNKNOWN
+                elif self._passive_power_is_confirmed(telemetry):
+                    outcome_state = PASSIVE_STATE_ACKNOWLEDGED
             self._set_passive_power_state(outcome_state)
         else:
             self._passive_samples.clear()
@@ -878,18 +884,15 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             await self._async_send_passive_power(PASSIVE_STATE_SENT, source=source)
 
     def _passive_power_is_confirmed(self, telemetry: PassiveTelemetry) -> bool:
-        """Return whether fresh mode data confirms the desired real output.
+        """Return whether ES status confirms the desired real output.
 
         Compensation aims the measurement at the desired value, so confirmation
         keeps comparing against what was requested rather than what was sent.
         """
-        if (
-            self._passive_desired_power is None
-            or telemetry.mode.get("mode") != MODE_PASSIVE
-        ):
+        if self._passive_desired_power is None:
             return False
 
-        reported_power = telemetry.actual
+        reported_power = telemetry.power("es")
         if reported_power is None:
             return False
 
@@ -898,6 +901,22 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             PASSIVE_POWER_ZERO_TOLERANCE,
         )
         return abs(reported_power - self._passive_desired_power) <= tolerance
+
+    def _cached_passive_output(self) -> PassiveTelemetry:
+        """Reuse a recent successful status read, independently of mode health."""
+        state = self._polling.sections["es"]
+        valid = (
+            not state.consecutive_failures
+            and state.last_success is not None
+            and state.last_success >= self._passive_command_changed_at
+            and monotonic() - state.last_success <= ES_FRESH_SECONDS
+        )
+        return PassiveTelemetry(
+            {},
+            self._last_good_data.get("es", {}),
+            {},
+            frozenset({"es"}) if valid else frozenset(),
+        )
 
     def _log_passive_power(self, source: str, actual: float | None = None) -> None:
         """Trace the requested output, the value sent, and what was measured."""
@@ -995,16 +1014,25 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             telemetry = PassiveTelemetry(
                 mode_data, es_data or {}, battery_data or {}, fresh
             )
+            confirmed = self._passive_power_is_confirmed(telemetry)
+            if telemetry.power("es") is None:
+                self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
+            elif confirmed:
+                self._set_passive_power_state(PASSIVE_STATE_ACKNOWLEDGED)
+            else:
+                self._set_passive_power_state(PASSIVE_STATE_SENT)
+            # Endpoint agreement remains a calibration/recovery safeguard only.
+            # ES.GetMode cannot veto acknowledgement of the measured output.
             actual = telemetry.actual
             if actual is None:
                 self._passive_samples.clear()
-                self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
                 return False
 
-            interrupted = telemetry.unexpected_zero(self._passive_desired_power)
+            interrupted = not confirmed and telemetry.unexpected_zero(
+                self._passive_desired_power
+            )
             if interrupted:
                 self._passive_samples.clear()
-                self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
                 if self._passive_desired_power < 0 and not telemetry.charging_permitted:
                     if confirmed_drop or not allow_send:
                         self._passive_charge_recovery_blocked = True
@@ -1016,20 +1044,16 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 if monotonic() - self._passive_last_send_at < PASSIVE_SETTLE_SECONDS:
                     return False
 
-            confirmed = self._passive_power_is_confirmed(telemetry)
-            if confirmed:
-                self._set_passive_power_state(PASSIVE_STATE_ACKNOWLEDGED)
-                if (
-                    self._passive_desired_power < 0
-                    and self._passive_charge_recovery_blocked
-                    and telemetry.charging_permitted
-                ):
-                    self._passive_charge_recovery_blocked = False
-                    self._schedule_passive_keepalive(
-                        delay=PASSIVE_POWER_KEEPALIVE_SECONDS, source="keepalive"
-                    )
-            else:
-                self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
+            if (
+                confirmed
+                and self._passive_desired_power < 0
+                and self._passive_charge_recovery_blocked
+                and telemetry.charging_permitted
+            ):
+                self._passive_charge_recovery_blocked = False
+                self._schedule_passive_keepalive(
+                    delay=PASSIVE_POWER_KEEPALIVE_SECONDS, source="keepalive"
+                )
 
             if not allow_send:
                 # Post-command reads only verify. Never start an unbounded chain
@@ -1150,39 +1174,42 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         if sequence != self._passive_send_sequence:
             self._discard_superseded_passive_readings(data)
             return
-        if "es_mode" not in fresh and self._passive_is_stable():
-            # Keep an existing acknowledgement using fresh ES status only.
-            # This path cannot acknowledge a newly issued command or learn.
-            actual = telemetry.power("es")
-            if actual is None:
-                return
-            tolerance = max(
-                abs(self._passive_desired_power) * PASSIVE_POWER_TOLERANCE,
-                PASSIVE_POWER_ZERO_TOLERANCE,
-            )
-            if abs(actual - self._passive_desired_power) <= tolerance:
+        if "es" not in fresh:
+            # Intentional polling skips may preserve an acknowledgement while
+            # the last output is still valid, but cannot confirm a new target.
+            if (
+                self._passive_power_state == PASSIVE_STATE_ACKNOWLEDGED
+                and self._passive_power_is_confirmed(self._cached_passive_output())
+            ):
                 return
             self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
-        suspect = telemetry.disagreement or telemetry.unexpected_zero(
-            self._passive_desired_power
+            self._passive_samples.clear()
+            return
+        if (
+            "es_mode" not in fresh
+            and self._passive_is_stable()
+            and self._passive_power_is_confirmed(telemetry)
+        ):
+            # Preserve the calibration window across intentional mode skips.
+            # New acknowledgements still use status alone in verification below.
+            return
+        suspect = not self._passive_power_is_confirmed(telemetry) and (
+            telemetry.disagreement
+            or telemetry.unexpected_zero(self._passive_desired_power)
         )
         # Missing/failed reads must never cause extra confirmation traffic.
         if suspect and "es" in fresh:
             self._passive_samples.clear()
-            self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
+            self._set_passive_power_state(
+                PASSIVE_STATE_UNKNOWN
+                if telemetry.power("es") is None
+                else PASSIVE_STATE_SENT
+            )
             self._log_passive_observation("suspected_interruption", telemetry)
             if monotonic() - self._passive_last_send_at < PASSIVE_SETTLE_SECONDS:
                 await self._async_wait_passive_settle()
             sequence, telemetry = await self._async_read_passive_telemetry(data)
             self._log_passive_observation("confirmation", telemetry)
-        elif suspect:
-            self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
-            return
-
-        if not fresh:
-            if not self._passive_is_stable():
-                self._set_passive_power_state(PASSIVE_STATE_UNKNOWN)
-            return
 
         sent = await self._async_verify_passive_power(
             telemetry.mode,

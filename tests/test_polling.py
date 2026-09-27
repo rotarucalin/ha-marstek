@@ -236,7 +236,7 @@ async def test_healthy_passive_mode_reduction_and_unknown_verification(
     assert coordinator.passive_power_state == "acknowledged"
 
 
-async def test_cached_mode_cannot_acknowledge_new_command(
+async def test_status_acknowledges_new_command_despite_mode_failure(
     coordinator, mock_marstek_api, clock
 ):
     mock_marstek_api.get_es_status.return_value = {"ongrid_power": 250}
@@ -248,7 +248,7 @@ async def test_cached_mode_cannot_acknowledge_new_command(
     clock.now += 30
     await coordinator.async_set_passive_power(260)
     await coordinator.async_refresh()
-    assert coordinator.passive_power_state == "unknown"
+    assert coordinator.passive_power_state == "acknowledged"
     assert coordinator._polling.sections["es_mode"].consecutive_failures == 1
     assert mock_marstek_api.set_es_mode_passive.call_count == 2
     clock.now += 30
@@ -389,8 +389,10 @@ async def test_stable_passive_leaves_slow_mode_polling_when_verification_needed(
         coordinator._schedule_passive_retry("verification_retry")
     await coordinator.async_refresh()
     assert mock_marstek_api.get_es_mode.call_count == 2
-    if reason in {"failed_status", "failed_mode"}:
+    if reason == "failed_status":
         assert coordinator.passive_power_state == "unknown"
+    elif reason == "failed_mode":
+        assert coordinator.passive_power_state == "acknowledged"
 
 
 async def test_degraded_new_command_can_be_verified_without_nonessential_reads(
@@ -483,8 +485,9 @@ async def test_zero_at_normal_cadence_recovers_even_when_mode_poll_was_skipped(
     assert coordinator.data["es"]["ongrid_power"] == 250
 
 
-async def test_mode_failure_backoff_survives_unknown_verification_request(
-    coordinator, mock_marstek_api, clock
+@pytest.mark.parametrize("raised_timeout", [False, True])
+async def test_mode_failure_backoff_preserves_power_acknowledgement(
+    coordinator, mock_marstek_api, clock, raised_timeout
 ):
     mock_marstek_api.get_es_status.return_value = {"ongrid_power": 250}
     mock_marstek_api.get_es_mode.return_value = {"mode": "Passive", "ongrid_power": 250}
@@ -496,17 +499,39 @@ async def test_mode_failure_backoff_survives_unknown_verification_request(
         clock.now = now
         await coordinator.async_refresh()
     clock.now = 1300
+    mock_marstek_api.get_es_mode.side_effect = TimeoutError if raised_timeout else None
     mock_marstek_api.get_es_mode.return_value = None
     await coordinator.async_refresh()
-    assert coordinator.passive_power_state == "unknown"
+    assert coordinator.passive_power_state == "acknowledged"
     deadline = coordinator._polling.sections["es_mode"].next_poll
     for elapsed in range(30, 300, 30):
         clock.now = 1300 + elapsed
         await coordinator.async_refresh()
+        assert coordinator.passive_power_state == "acknowledged"
         assert mock_marstek_api.get_es_mode.call_count == 2
         assert coordinator._polling.sections["es_mode"].next_poll == deadline
     clock.now = deadline
+    mock_marstek_api.get_es_mode.side_effect = None
     mock_marstek_api.get_es_mode.return_value = {"mode": "Passive", "ongrid_power": 250}
     await coordinator.async_refresh()
     assert coordinator.passive_power_state == "acknowledged"
     assert coordinator._polling.sections["es_mode"].consecutive_failures == 0
+
+
+async def test_reduced_mode_polling_preserves_calibration_samples(
+    coordinator, mock_marstek_api, clock
+):
+    mock_marstek_api.get_es_status.return_value = {"ongrid_power": 240}
+    mock_marstek_api.get_es_mode.return_value = {"mode": "Passive", "ongrid_power": 240}
+    await coordinator.async_set_passive_power(240)
+    clock.now += 16
+    await coordinator.async_refresh()
+    samples = list(coordinator._passive_samples)
+    assert len(samples) == 1
+    for _ in range(2):
+        clock.now += 30
+        await coordinator.async_refresh()
+        assert coordinator.passive_power_state == "acknowledged"
+        assert list(coordinator._passive_samples) == samples
+    assert mock_marstek_api.get_es_mode.call_count == 1
+    assert mock_marstek_api.get_es_status.call_count == 3

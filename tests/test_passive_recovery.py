@@ -127,7 +127,7 @@ async def test_confirmed_zero_recovers_compensated_target_and_publishes_new_data
 
 
 @pytest.mark.parametrize("recovery", [-760, 340], indirect=True)
-async def test_transient_zero_marks_unknown_before_confirmation_without_resending(
+async def test_transient_zero_marks_sent_before_confirmation_without_resending(
     recovery, monkeypatch, caplog
 ):
     coordinator, api, _ = recovery
@@ -138,7 +138,7 @@ async def test_transient_zero_marks_unknown_before_confirmation_without_resendin
     read = coordinator._async_read_passive_telemetry
 
     async def confirm(data):
-        assert coordinator.passive_power_state == "unknown"
+        assert coordinator.passive_power_state == "sent"
         assert not coordinator._passive_samples
         api.set_es_mode_passive.assert_not_called()
         return await read(data)
@@ -159,7 +159,7 @@ async def test_transient_zero_marks_unknown_before_confirmation_without_resendin
 @pytest.mark.parametrize(
     "first_status,first_mode", [(0, -768), (-768, 0), (0, 0), (-768, -400)]
 )
-async def test_transient_zero_or_disagreement_is_confirmed_without_a_write(
+async def test_status_zero_is_confirmed_but_mode_disagreement_cannot_veto_output(
     recovery,
     first_status,
     first_mode,
@@ -174,28 +174,35 @@ async def test_transient_zero_or_disagreement_is_confirmed_without_a_write(
     assert coordinator.passive_power_state == "acknowledged"
     assert coordinator.data["es"]["ongrid_power"] == -768
     assert coordinator.calibration_snapshot() == original_map
-    assert len(observations(caplog)) == 2
+    assert len(observations(caplog)) == (2 if first_status == 0 else 0)
+    assert api.get_es_status.call_count == (2 if first_status == 0 else 1)
 
 
-async def test_persistent_endpoint_disagreement_never_acknowledges_or_learns(recovery):
+async def test_status_mismatch_with_endpoint_disagreement_never_acknowledges_or_learns(
+    recovery,
+):
     coordinator, api, _ = recovery
     original_map = coordinator.calibration_snapshot()
     api.get_es_status.return_value = status(0)
     api.get_es_mode.return_value = mode(-768)
     await coordinator.async_refresh()
     api.set_es_mode_passive.assert_not_called()
-    assert coordinator.passive_power_state == "unknown"
+    assert coordinator.passive_power_state == "sent"
     assert not coordinator._passive_samples
     assert coordinator.calibration_snapshot() == original_map
     assert api.get_es_status.call_count == api.get_es_mode.call_count == 2
 
 
 @pytest.mark.parametrize("missing", ["get_es_status", "get_es_mode"])
-async def test_cached_endpoint_cannot_acknowledge_or_learn(recovery, missing):
+async def test_missing_status_is_unknown_but_missing_mode_only_blocks_learning(
+    recovery, missing
+):
     coordinator, api, _ = recovery
     getattr(api, missing).return_value = None
     await coordinator.async_refresh()
-    assert coordinator.passive_power_state == "unknown"
+    assert coordinator.passive_power_state == (
+        "unknown" if missing == "get_es_status" else "acknowledged"
+    )
     assert not coordinator._passive_samples
     api.set_es_mode_passive.assert_not_called()
 
@@ -220,7 +227,7 @@ async def test_zero_recovery_requires_fresh_charging_permission_only_for_chargin
     api.get_es_mode.return_value = mode(0)
     api.get_battery_status.return_value = battery
     await coordinator.async_refresh()
-    assert coordinator.passive_power_state == "unknown"
+    assert coordinator.passive_power_state == "sent"
     assert not coordinator._passive_samples
     if coordinator.desired_power < 0:
         api.set_es_mode_passive.assert_not_called()
@@ -273,7 +280,9 @@ async def test_failed_or_zero_post_recovery_read_does_not_loop_or_reuse_cache(
     ]
     await coordinator.async_refresh()
     api.set_es_mode_passive.assert_called_once_with(coordinator.command_power)
-    assert coordinator.passive_power_state == "unknown"
+    assert coordinator.passive_power_state == (
+        "unknown" if response is None else "sent"
+    )
     assert not coordinator._passive_samples
     assert api.get_es_status.call_count == api.get_es_mode.call_count == 3
     if response is None:
@@ -316,7 +325,7 @@ async def test_permission_lost_after_recovery_pauses_maintenance(recovery, caplo
     await coordinator.async_refresh()
     api.set_es_mode_passive.assert_called_once_with(coordinator.command_power)
     assert coordinator._passive_keepalive_cancel is None
-    assert coordinator.passive_power_state == "unknown"
+    assert coordinator.passive_power_state == "sent"
     assert "recovery_blocked" in [event["phase"] for event in observations(caplog)]
 
 
@@ -400,7 +409,7 @@ async def test_failed_recovery_write_is_followed_by_measurement_without_an_inlin
     await coordinator.async_refresh()
     api.set_es_mode_passive.assert_called_once_with(coordinator.command_power)
     assert api.get_es_status.call_count == api.get_es_mode.call_count == 3
-    assert coordinator.passive_power_state == "unknown"
+    assert coordinator.passive_power_state == "sent"
     assert coordinator._passive_keepalive_cancel is None
     assert coordinator._passive_retry is not None
     assert coordinator._passive_retry.source == "verification_retry"
@@ -425,17 +434,18 @@ async def test_fresh_reads_restore_acknowledged_after_communication_loss(
             endpoints[key].return_value = None
         for _ in range(missed_polls):
             await coordinator.async_refresh()
-            assert coordinator.passive_power_state == "unknown"
-            assert published[-1] == "unknown"
+            expected = "unknown" if "es" in missing else "acknowledged"
+            assert coordinator.passive_power_state == expected
+            assert published[-1] == expected
         if missed_polls > 6:
             assert all(key not in coordinator.data for key in missing)
 
-        # One recovered endpoint is insufficient when both were lost.
+        # Recovered status is sufficient even while mode is still unavailable.
         if len(missing) == 2:
             endpoints["es"].return_value = readings["es"]
             await coordinator.async_refresh()
-            assert coordinator.passive_power_state == "unknown"
-            assert published[-1] == "unknown"
+            assert coordinator.passive_power_state == "acknowledged"
+            assert published[-1] == "acknowledged"
 
         for key in missing:
             endpoints[key].return_value = readings[key]

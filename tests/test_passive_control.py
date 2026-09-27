@@ -174,7 +174,7 @@ async def test_real_timer_runs_keepalive_and_retry_on_event_loop(
             call(240),
             call(240),
         ]
-        assert coordinator.passive_power_state == "sent"
+        assert coordinator.passive_power_state == ("unknown" if success else "sent")
         assert coordinator._passive_keepalive_cancel is not None
     finally:
         await coordinator.async_stop_passive_control()
@@ -511,7 +511,7 @@ async def test_verification_resend_replaces_timer(
     assert (
         "desired=240W command=240W reported_mode=Auto reported_power=0W" in caplog.text
     )
-    assert coordinator.passive_power_state == ("retrying" if success else "unknown")
+    assert coordinator.passive_power_state == ("retrying" if success else "sent")
     await old_timer.fire()
     assert command_timers.current is replacement
     assert mock_marstek_api.set_es_mode_passive.call_count == 2
@@ -987,7 +987,7 @@ async def test_unexpected_zero_never_enters_adaptive_compensation(
         PASSIVE_STABILITY_SAMPLES if confirmed_drop else 0
     )
     if not confirmed_drop:
-        assert coordinator.passive_power_state == "unknown"
+        assert coordinator.passive_power_state == "sent"
 
 
 @pytest.mark.parametrize("desired", [-760, 340])
@@ -1005,7 +1005,7 @@ async def test_confirmed_zero_inside_settle_window_does_not_resend(
     )
     assert not sent
     mock_marstek_api.set_es_mode_passive.assert_not_called()
-    assert coordinator.passive_power_state == "unknown"
+    assert coordinator.passive_power_state == "sent"
     assert not coordinator._passive_samples
 
 
@@ -1306,3 +1306,156 @@ async def test_restart_resets_passive_state_to_acknowledged(
     await restarted.async_refresh()
     assert restarted.passive_power_state == "acknowledged"
     assert restarted.desired_power is None
+
+
+@pytest.mark.parametrize(
+    "desired,actual", [(240, 230), (-240, -230), (0, 0), (0, 10), (10, 0)]
+)
+@pytest.mark.parametrize(
+    "reported_mode",
+    ["Passive", "Auto", "missing", "timeout", "disagreement", "no_power"],
+)
+async def test_output_acknowledgement_is_independent_of_mode(
+    coordinator, mock_marstek_api, desired, actual, reported_mode
+):
+    """Status confirms physical power even without usable mode telemetry."""
+    mock_marstek_api.get_es_status.return_value = {"ongrid_power": actual}
+    if reported_mode == "missing":
+        mock_marstek_api.get_es_mode.return_value = None
+    elif reported_mode == "timeout":
+        mock_marstek_api.get_es_mode.side_effect = TimeoutError
+    elif reported_mode == "disagreement":
+        mock_marstek_api.get_es_mode.return_value = {
+            "mode": "Passive",
+            "ongrid_power": 999,
+        }
+    elif reported_mode == "no_power":
+        mock_marstek_api.get_es_mode.return_value = {"mode": "Auto"}
+    else:
+        mock_marstek_api.get_es_mode.return_value = {
+            "mode": reported_mode,
+            "ongrid_power": actual,
+        }
+    assert await coordinator.async_set_passive_power(desired)
+    assert coordinator.passive_power_state == "sent"
+    await coordinator.async_refresh()
+    assert coordinator.passive_power_state == "acknowledged"
+    mock_marstek_api.set_es_mode_passive.assert_called_once_with(desired)
+    assert mock_marstek_api.get_es_status.call_count == 1
+
+
+@pytest.mark.parametrize("actual", [None, True, "240", float("nan"), float("inf")])
+async def test_unusable_status_cannot_be_confirmed_by_matching_mode(
+    coordinator, mock_marstek_api, actual
+):
+    await coordinator.async_set_passive_power(240)
+    mock_marstek_api.get_es_status.return_value = {"ongrid_power": actual}
+    mock_marstek_api.get_es_mode.return_value = {"mode": "Passive", "ongrid_power": 240}
+    await coordinator.async_refresh()
+    assert coordinator.passive_power_state == "unknown"
+    mock_marstek_api.set_es_mode_passive.assert_called_once_with(240)
+
+
+@pytest.mark.parametrize("desired", [-240, 240])
+@pytest.mark.parametrize("measurement", ["desired", "command", "opposite"])
+async def test_acknowledgement_compares_desired_physical_power(
+    coordinator, mock_marstek_api, desired, measurement
+):
+    # Offset exceeds the acknowledgement tolerance to distinguish desired
+    # physical power from the calibrated command sent to the device.
+    coordinator.calibration.observe(desired, desired, desired - 100)
+    original_map = coordinator.calibration_snapshot()
+    await coordinator.async_set_passive_power(desired)
+    command = coordinator.command_power
+    assert abs(command - desired) > abs(desired) * 0.2
+    actual = {"desired": desired, "command": command, "opposite": -desired}[measurement]
+    await coordinator._async_verify_passive_power(
+        {"mode": "Passive", "ongrid_power": actual},
+        es_data={"ongrid_power": actual},
+        fresh=frozenset({"es", "es_mode"}),
+        allow_send=False,
+    )
+    assert coordinator.passive_power_state == (
+        "acknowledged" if measurement == "desired" else "sent"
+    )
+    assert coordinator.calibration_snapshot() == original_map
+    mock_marstek_api.set_es_mode_passive.assert_called_once_with(command)
+
+
+@pytest.mark.parametrize("reported_mode", ["Auto", "timeout"])
+async def test_successful_keepalive_preserves_acknowledgement_without_mode(
+    coordinator, mock_marstek_api, command_timers, clock, reported_mode
+):
+    mock_marstek_api.get_es_status.return_value = {"ongrid_power": 240}
+    if reported_mode == "timeout":
+        mock_marstek_api.get_es_mode.side_effect = TimeoutError
+    else:
+        mock_marstek_api.get_es_mode.return_value = {
+            "mode": reported_mode,
+            "ongrid_power": 0,
+        }
+    await coordinator.async_set_passive_power(240)
+    await coordinator.async_refresh()
+    assert coordinator.passive_power_state == "acknowledged"
+    published = []
+    cancel = coordinator.async_add_listener(
+        lambda: published.append(coordinator.passive_power_state)
+    )
+    try:
+        clock.advance(30)
+        await command_timers.current.fire()
+        assert coordinator.passive_power_state == "acknowledged"
+        assert "sent" not in published
+        assert "unknown" not in published
+        assert command_timers.current.delay == 180
+        assert mock_marstek_api.set_es_mode_passive.call_args_list == [
+            call(240),
+            call(240),
+        ]
+    finally:
+        cancel()
+
+
+@pytest.mark.parametrize("action", ["poll", "keepalive"])
+@pytest.mark.parametrize("age,expected", [(60, "acknowledged"), (61, "unknown")])
+async def test_cached_output_expires_independently_of_mode(
+    coordinator, mock_marstek_api, command_timers, clock, action, age, expected
+):
+    mock_marstek_api.get_es_status.return_value = {"ongrid_power": 240}
+    mock_marstek_api.get_es_mode.return_value = {"mode": "Auto", "ongrid_power": 240}
+    await coordinator.async_set_passive_power(240)
+    await coordinator.async_refresh()
+    # Simulate an intentional ES polling skip rather than a new measurement.
+    coordinator._polling.sections["es"].next_poll = clock() + 300
+    clock.advance(age)
+    if action == "poll":
+        await coordinator.async_refresh()
+    else:
+        await command_timers.current.fire()
+    assert coordinator.passive_power_state == expected
+    assert mock_marstek_api.get_es_status.call_count == 1
+
+
+async def test_new_target_waits_for_output_confirmation(
+    coordinator, mock_marstek_api, clock
+):
+    mock_marstek_api.get_es_status.return_value = {"ongrid_power": 240}
+    mock_marstek_api.get_es_mode.return_value = {"mode": "Auto", "ongrid_power": 240}
+    await coordinator.async_set_passive_power(240)
+    await coordinator.async_refresh()
+    assert coordinator.passive_power_state == "acknowledged"
+    clock.advance(1)
+    await coordinator.async_set_passive_power(600)
+    assert coordinator.passive_power_state == "sent"
+    await coordinator._async_verify_passive_power(
+        {"mode": "Passive", "ongrid_power": 600},
+        es_data={"ongrid_power": 240},
+        fresh=frozenset({"es", "es_mode"}),
+        allow_send=False,
+    )
+    assert coordinator.passive_power_state == "sent"
+    mock_marstek_api.get_es_status.return_value = {"ongrid_power": 590}
+    clock.advance(30)
+    await coordinator.async_refresh()
+    assert coordinator.passive_power_state == "acknowledged"
+    assert mock_marstek_api.set_es_mode_passive.call_args_list == [call(240), call(600)]

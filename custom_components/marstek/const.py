@@ -6,10 +6,12 @@ DOMAIN = "marstek"
 CONF_HOST = "host"
 CONF_PORT = "port"
 CONF_MAX_PASSIVE_POWER = "max_passive_power"
+CONF_PASSIVE_KEEPALIVE_SECONDS = "passive_keepalive_seconds"
 
 # Default values
 DEFAULT_PORT = 30000
 DEFAULT_NAME = "Marstek Battery System"
+DEFAULT_PASSIVE_KEEPALIVE_SECONDS = 180
 
 # Device models, as named in chapter 4 of the Marstek Device Open API (Rev 3.1).
 # Firmware reports these with varying spelling ("VenusC", "Venus C", and the

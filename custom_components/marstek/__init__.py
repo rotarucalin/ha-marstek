@@ -24,7 +24,9 @@ from .const import (
     CALIBRATION_STORAGE_KEY_FMT,
     CALIBRATION_STORAGE_VERSION,
     CONF_MAX_PASSIVE_POWER,
+    CONF_PASSIVE_KEEPALIVE_SECONDS,
     DEFAULT_MAX_PASSIVE_POWER,
+    DEFAULT_PASSIVE_KEEPALIVE_SECONDS,
     DOMAIN,
     MODE_AI,
     MODE_AUTO,
@@ -71,7 +73,6 @@ PLATFORMS: list[Platform] = [
 SCAN_INTERVAL = timedelta(seconds=30)
 # EM is disabled only on an explicit CT disconnection, not on request failure.
 OPTIONAL_SECTIONS = frozenset({"ble"})
-PASSIVE_POWER_KEEPALIVE_SECONDS = 180
 PASSIVE_POWER_RETRY_SECONDS = 15
 PASSIVE_POWER_TOLERANCE = 0.20
 PASSIVE_POWER_ZERO_TOLERANCE = 10
@@ -124,7 +125,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await async_register_services(hass)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    # A changed "max passive power" option needs a fresh calibration clamp.
+    # Apply changed options through a fresh coordinator.
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
     return True
 
@@ -163,6 +164,9 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         """Initialize."""
         self.api = api
         self.entry = entry
+        self._passive_keepalive_seconds = entry.options.get(
+            CONF_PASSIVE_KEEPALIVE_SECONDS, DEFAULT_PASSIVE_KEEPALIVE_SECONDS
+        )
         # Retain the exact stored spelling so existing entity IDs remain stable.
         self.device_id = entry.unique_id if normalize_mac(entry.unique_id) else None
         cached_info = entry.data.get(CONF_DEVICE_INFO, {})
@@ -727,9 +731,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             return success
         self._passive_last_send_ok = success
         if success:
-            self._schedule_passive_keepalive(
-                delay=PASSIVE_POWER_KEEPALIVE_SECONDS, source="keepalive"
-            )
+            self._schedule_passive_keepalive(source="keepalive")
             if source == "keepalive":
                 telemetry = self._cached_passive_output()
                 if telemetry.power("es") is None:
@@ -828,7 +830,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             # The network request itself can outlast the settle period.
             self._passive_command_changed_at = self._passive_last_send_at
 
-    def _schedule_passive_keepalive(self, *, delay: int, source: str) -> None:
+    def _schedule_passive_keepalive(self, *, source: str) -> None:
         """Restart normal maintenance after a successful command."""
         self._cancel_passive_keepalive()
         generation = self._passive_control_generation
@@ -838,7 +840,14 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             await self._async_keepalive_passive_power(generation, source=source)
 
         self._passive_keepalive_cancel = async_call_later(
-            self.hass, delay, async_keepalive
+            self.hass, self._passive_keepalive_seconds, async_keepalive
+        )
+        _LOGGER.debug(
+            "Marstek passive keepalive scheduled: device=%s desired_w=%s "
+            "keepalive_interval=%ss cd_time=3600s",
+            self.entry.title,
+            self._passive_desired_power,
+            self._passive_keepalive_seconds,
         )
 
     def _cancel_passive_keepalive(self) -> None:
@@ -1051,9 +1060,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 and telemetry.charging_permitted
             ):
                 self._passive_charge_recovery_blocked = False
-                self._schedule_passive_keepalive(
-                    delay=PASSIVE_POWER_KEEPALIVE_SECONDS, source="keepalive"
-                )
+                self._schedule_passive_keepalive(source="keepalive")
 
             if not allow_send:
                 # Post-command reads only verify. Never start an unbounded chain

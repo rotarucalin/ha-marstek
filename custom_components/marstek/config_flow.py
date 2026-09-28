@@ -11,10 +11,17 @@ from homeassistant import config_entries
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+)
 
 from .const import (
     CONF_MAX_PASSIVE_POWER,
+    CONF_PASSIVE_KEEPALIVE_SECONDS,
     DEFAULT_MAX_PASSIVE_POWER,
+    DEFAULT_PASSIVE_KEEPALIVE_SECONDS,
     DEFAULT_PORT,
     DOMAIN,
     MAX_PASSIVE_POWER_LIMIT,
@@ -132,6 +139,21 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_MAX_PASSIVE_POWER, default=current
                 ): MAX_PASSIVE_POWER_SELECTOR,
+                vol.Optional(
+                    CONF_PASSIVE_KEEPALIVE_SECONDS,
+                    default=self.config_entry.options.get(
+                        CONF_PASSIVE_KEEPALIVE_SECONDS,
+                        DEFAULT_PASSIVE_KEEPALIVE_SECONDS,
+                    ),
+                ): NumberSelector(
+                    NumberSelectorConfig(
+                        min=60,
+                        max=3500,
+                        step=60,
+                        unit_of_measurement="s",
+                        mode=NumberSelectorMode.BOX,
+                    )
+                ),
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)

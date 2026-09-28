@@ -16,13 +16,14 @@ from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from custom_components.marstek import (
-    PASSIVE_POWER_KEEPALIVE_SECONDS,
     PASSIVE_POWER_RETRY_SECONDS,
     MarstekDataUpdateCoordinator,
 )
 from custom_components.marstek.const import (
     CALIBRATION_STORAGE_KEY_FMT,
     CALIBRATION_STORAGE_VERSION,
+    CONF_PASSIVE_KEEPALIVE_SECONDS,
+    DEFAULT_PASSIVE_KEEPALIVE_SECONDS,
     DOMAIN,
     PASSIVE_COMMAND_MAX,
     PASSIVE_DEADBAND_W,
@@ -89,8 +90,12 @@ def command_timers():
 
 
 @pytest.fixture
-async def coordinator(hass, marstek_entry, mock_marstek_api, command_timers, caplog):
+async def coordinator(hass, marstek_entry, mock_marstek_api, command_timers, caplog, request):
     marstek_entry.add_to_hass(hass)
+    if hasattr(request, "param"):
+        hass.config_entries.async_update_entry(
+            marstek_entry, options={CONF_PASSIVE_KEEPALIVE_SECONDS: request.param}
+        )
     caplog.set_level(logging.DEBUG, logger=LOGGER)
     coordinator = MarstekDataUpdateCoordinator(hass, mock_marstek_api, marstek_entry)
     yield coordinator
@@ -164,7 +169,7 @@ async def test_real_timer_runs_keepalive_and_retry_on_event_loop(
         assert await coordinator.async_set_passive_power(240) is success
         mock_marstek_api.set_es_mode_passive.return_value = True
         delay = (
-            PASSIVE_POWER_KEEPALIVE_SECONDS if success else PASSIVE_POWER_RETRY_SECONDS
+            DEFAULT_PASSIVE_KEEPALIVE_SECONDS if success else PASSIVE_POWER_RETRY_SECONDS
         )
         freezer.tick(timedelta(seconds=delay + 1))
         async_fire_time_changed(hass, dt_util.utcnow())
@@ -180,19 +185,25 @@ async def test_real_timer_runs_keepalive_and_retry_on_event_loop(
         await coordinator.async_stop_passive_control()
 
 
+@pytest.mark.parametrize("coordinator", [180, 600, 3500], indirect=True)
 async def test_new_target_and_successful_keepalive(
     coordinator, command_timers, mock_marstek_api, caplog
 ):
-    """New targets are logged; healthy keepalives silently maintain the cadence."""
-    assert PASSIVE_POWER_KEEPALIVE_SECONDS == 180
+    """Successful commands maintain the configured cadence and log scheduling."""
+    assert DEFAULT_PASSIVE_KEEPALIVE_SECONDS == 180
     assert PASSIVE_POWER_RETRY_SECONDS == 15
+    interval = coordinator.entry.options[CONF_PASSIVE_KEEPALIVE_SECONDS]
     assert await coordinator.async_set_passive_power(240)
-    assert command_timers.current.delay == 180
+    assert command_timers.current.delay == interval
     assert coordinator.passive_power_state == "sent"
     initial_logs = list(caplog.records)
     await command_timers.current.fire()
-    assert caplog.records == initial_logs
-    assert command_timers.current.delay == 180
+    assert len(caplog.records) == len(initial_logs) + 1
+    assert caplog.records[-1].message == (
+        "Marstek passive keepalive scheduled: device=Marstek Venus A desired_w=240 "
+        f"keepalive_interval={interval}s cd_time=3600s"
+    )
+    assert command_timers.current.delay == interval
     assert mock_marstek_api.set_es_mode_passive.call_args_list == [call(240), call(240)]
     messages = outgoing_messages(caplog)
     assert len(messages) == 1
@@ -210,6 +221,7 @@ async def test_new_target_and_successful_keepalive(
 @pytest.mark.parametrize(
     "failure", [False, TimeoutError("timed out"), OSError("offline")]
 )
+@pytest.mark.parametrize("coordinator", [180, 600], indirect=True)
 async def test_failed_keepalives_retry_until_success(
     coordinator, command_timers, mock_marstek_api, caplog, failure
 ):
@@ -239,7 +251,9 @@ async def test_failed_keepalives_retry_until_success(
 
     caplog.clear()
     await command_timers.current.fire()
-    assert command_timers.current.delay == 180
+    assert command_timers.current.delay == coordinator.entry.options[
+        CONF_PASSIVE_KEEPALIVE_SECONDS
+    ]
     assert "source=keepalive_retry" in outgoing_messages(caplog)[0]
     assert "Marstek command succeeded:" in caplog.text
     assert mock_marstek_api.set_es_mode_passive.call_args_list == [call(240)] * 4
@@ -1032,7 +1046,7 @@ async def test_one_retry_path_preserves_origin_until_success(
     else:
         await coordinator.async_set_passive_power(240)
         mock_marstek_api.set_es_mode_passive.return_value = False
-        clock.advance(PASSIVE_POWER_KEEPALIVE_SECONDS)
+        clock.advance(DEFAULT_PASSIVE_KEEPALIVE_SECONDS)
         if origin == "keepalive":
             await command_timers.current.fire()
         else:
@@ -1066,7 +1080,7 @@ async def test_one_retry_path_preserves_origin_until_success(
     assert not coordinator._passive_command_in_flight
     assert coordinator._passive_last_send_ok
     assert coordinator.passive_power_state == "sent"
-    assert command_timers.current.delay == PASSIVE_POWER_KEEPALIVE_SECONDS
+    assert command_timers.current.delay == DEFAULT_PASSIVE_KEEPALIVE_SECONDS
     assert all(
         args == call(253)
         for args in mock_marstek_api.set_es_mode_passive.call_args_list
@@ -1090,7 +1104,7 @@ async def test_one_retry_path_preserves_origin_until_success(
     assert coordinator.passive_power_state == "acknowledged"
     await keepalive.fire()
     assert mock_marstek_api.set_es_mode_passive.call_count == calls + 1
-    assert command_timers.current.delay == PASSIVE_POWER_KEEPALIVE_SECONDS
+    assert command_timers.current.delay == DEFAULT_PASSIVE_KEEPALIVE_SECONDS
 
     for event in (
         "retry scheduled",
@@ -1174,7 +1188,7 @@ async def test_new_target_invalidates_retry_already_queued_ahead_of_it(
         call(240),
         call(new_power),
     ]
-    assert command_timers.current.delay == PASSIVE_POWER_KEEPALIVE_SECONDS
+    assert command_timers.current.delay == DEFAULT_PASSIVE_KEEPALIVE_SECONDS
     assert "retry cancelled:" in caplog.text
     assert "stale retry discarded:" in caplog.text
     assert (
@@ -1212,7 +1226,7 @@ async def test_new_targets_supersede_in_flight_command_without_old_recovery(
             await asyncio.gather(old_target, intermediate, newest)
     assert sent == [240, 400]
     assert len(command_timers.history) == 1
-    assert command_timers.current.delay == PASSIVE_POWER_KEEPALIVE_SECONDS
+    assert command_timers.current.delay == DEFAULT_PASSIVE_KEEPALIVE_SECONDS
     assert coordinator.desired_power == 400
     assert coordinator._passive_retry is None
 
@@ -1459,3 +1473,28 @@ async def test_new_target_waits_for_output_confirmation(
     await coordinator.async_refresh()
     assert coordinator.passive_power_state == "acknowledged"
     assert mock_marstek_api.set_es_mode_passive.call_args_list == [call(240), call(600)]
+
+
+@pytest.mark.parametrize("coordinator", [180, 600], indirect=True)
+async def test_duplicate_target_preserves_keepalive_and_new_target_replaces_it(
+    coordinator, command_timers, mock_marstek_api
+):
+    """Only a changed target replaces the timer, including already queued jobs."""
+    assert await coordinator.async_set_passive_power(240)
+    keepalive = command_timers.current
+    assert await coordinator.async_set_passive_power(240)
+    assert command_timers.current is keepalive
+    mock_marstek_api.set_es_mode_passive.assert_called_once_with(240)
+
+    assert await coordinator.async_set_passive_power(300)
+    replacement = command_timers.current
+    assert not keepalive.active
+    assert replacement.delay == coordinator.entry.options[CONF_PASSIVE_KEEPALIVE_SECONDS]
+    await keepalive.fire()
+    assert command_timers.current is replacement
+    assert mock_marstek_api.set_es_mode_passive.call_args_list == [call(240), call(300)]
+    await replacement.fire()
+    assert mock_marstek_api.set_es_mode_passive.call_args_list == [
+        call(240), call(300), call(300)
+    ]
+    assert command_timers.current.delay == replacement.delay

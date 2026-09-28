@@ -13,6 +13,103 @@ from custom_components.marstek.marstek_api import MarstekAPI
 API_MODULE = "custom_components.marstek.marstek_api"
 
 
+@pytest.mark.parametrize("log_level", [logging.DEBUG, logging.INFO])
+@pytest.mark.parametrize(
+    ("api_method", "args", "method", "params", "destination"),
+    [
+        ("get_es_status", (), "ES.GetStatus", {"id": 0}, "192.0.2.1"),
+        ("get_es_mode", (), "ES.GetMode", {"id": 0}, "192.0.2.1"),
+        ("get_battery_status", (), "Bat.GetStatus", {"id": 0}, "192.0.2.1"),
+        ("get_pv_status", (), "PV.GetStatus", {"id": 0}, "192.0.2.1"),
+        ("get_wifi_status", (), "Wifi.GetStatus", {"id": 0}, "192.0.2.1"),
+        ("get_ble_status", (), "BLE.GetStatus", {"id": 0}, "192.0.2.1"),
+        ("get_em_status", (), "EM.GetStatus", {"id": 0}, "192.0.2.1"),
+        ("get_device_info", (), "Marstek.GetDevice", {"ble_mac": "0"}, "192.0.2.1"),
+        (
+            "_send_request",
+            ("Future.GetStatus",),
+            "Future.GetStatus",
+            {"id": 0},
+            "192.0.2.1",
+        ),
+        (
+            "set_es_mode_passive",
+            (-827,),
+            "ES.SetMode",
+            {
+                "id": 0,
+                "config": {
+                    "mode": "Passive",
+                    "passive_cfg": {"power": -827, "cd_time": 3600},
+                },
+            },
+            "192.0.2.1",
+        ),
+        (
+            "discover_devices",
+            (),
+            "Marstek.GetDevice",
+            {"ble_mac": "0"},
+            "255.255.255.255",
+        ),
+        (
+            "discover_devices",
+            ("192.0.2.255",),
+            "Marstek.GetDevice",
+            {"ble_mac": "0"},
+            "192.0.2.255",
+        ),
+    ],
+)
+def test_tx_logs_wire_payload_before_send(
+    caplog, log_level, api_method, args, method, params, destination
+):
+    """Reads, writes and discovery log exact requests once, only at DEBUG."""
+    api = MarstekAPI("venus-a.local", port=30001)
+    api._request_id = 122
+    caplog.set_level(log_level, logger=API_MODULE)
+    expected = {"id": 123, "method": method, "params": params}
+    discovery = api_method == "discover_devices"
+    host = destination if discovery else api.host
+
+    def send(payload, address):
+        sent = json.loads(payload)
+        records = [r for r in caplog.records if r.message.startswith("Marstek TX:")]
+        if log_level == logging.DEBUG:
+            assert len(records) == 1
+            assert records[0].levelno == logging.DEBUG
+            assert records[0].message == (
+                f"Marstek TX: host={host} ip={destination} port=30001 "
+                f"request_id={sent['id']} method={method} params={params}"
+            )
+        else:
+            assert records == []
+        return len(payload)
+
+    with (
+        patch(f"{API_MODULE}.socket.gethostbyname", return_value="192.0.2.1"),
+        patch(f"{API_MODULE}.socket.socket") as socket_factory,
+    ):
+        connection = socket_factory.return_value.__enter__.return_value
+        connection.sendto.side_effect = send
+        connection.recvfrom.side_effect = [
+            (b'{"id":123,"result":{"set_result":true}}', ("192.0.2.1", api.port)),
+            TimeoutError(),
+        ]
+        result = getattr(api, api_method)(*args)
+        if discovery:
+            assert result == [{"set_result": True, "ip": "192.0.2.1"}]
+        elif method == "ES.SetMode":
+            assert result is True
+        else:
+            assert result == {"set_result": True}
+        connection.sendto.assert_called_once_with(
+            json.dumps(expected).encode("utf-8"), (destination, api.port)
+        )
+    records = [r for r in caplog.records if r.message.startswith("Marstek TX:")]
+    assert len(records) == (1 if log_level == logging.DEBUG else 0)
+
+
 @pytest.mark.parametrize("host", ["192.0.2.1", "venus-a.local"])
 def test_request_validates_resolved_sender(host):
     """Literal IPv4 addresses and hostnames accept the resolved device's reply."""

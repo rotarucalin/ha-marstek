@@ -81,6 +81,15 @@ class MarstekAPI:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                 sock.settimeout(self.timeout)
                 message = json.dumps(request).encode("utf-8")
+                _LOGGER.debug(
+                    "Marstek TX: host=%s ip=%s port=%s request_id=%s method=%s params=%s",
+                    self.host,
+                    resolved_ip,
+                    self.port,
+                    request["id"],
+                    request["method"],
+                    request["params"],
+                )
                 sock.sendto(message, (resolved_ip, self.port))
                 deadline = monotonic() + self.timeout
                 while True:
@@ -180,6 +189,15 @@ class MarstekAPI:
                 sock.settimeout(self.timeout)
 
                 message = json.dumps(request).encode("utf-8")
+                _LOGGER.debug(
+                    "Marstek TX: host=%s ip=%s port=%s request_id=%s method=%s params=%s",
+                    broadcast_address,
+                    broadcast_address,
+                    self.port,
+                    request["id"],
+                    request["method"],
+                    request["params"],
+                )
                 sock.sendto(message, (broadcast_address, self.port))
 
                 try:

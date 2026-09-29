@@ -39,3 +39,28 @@ def test_cached_zeros_are_not_suspect(desired):
         {"ongrid_power": 0}, {"ongrid_power": 0}, {}, frozenset()
     )
     assert not telemetry.unexpected_zero(desired)
+
+
+@pytest.mark.parametrize(
+    "battery,es,fresh,expected",
+    [
+        ({"soc": 50, "charg_flag": True}, {}, {"battery"}, True),
+        ({"soc": 50, "charg_flag": 1}, {}, {"battery"}, True),
+        ({"soc": 50, "charg_flag": False}, {}, {"battery"}, False),
+        ({"charg_flag": False}, {}, {"battery"}, False),
+        ({"soc": 50, "charg_flag": 0}, {}, {"battery"}, False),
+        ({"soc": 100, "charg_flag": True}, {}, {"battery"}, False),
+        ({}, {}, {"battery"}, None),
+        ({"soc": 50}, {}, {"battery"}, None),
+        ({"soc": 50, "charg_flag": None}, {}, {"battery"}, None),
+        ({"soc": 100, "charg_flag": None}, {}, {"battery"}, None),
+        ({"charg_flag": True}, {}, {"battery"}, None),
+        ({"soc": 50, "charg_flag": False}, {}, {"es"}, None),
+        ({"soc": 50, "charg_flag": True}, {}, {"es"}, None),
+        ({"charg_flag": True}, {"bat_soc": 50}, {"battery", "es"}, True),
+        ({"charg_flag": True}, {"bat_soc": 50}, {"battery"}, None),
+    ],
+)
+def test_charging_permission_requires_fresh_evidence(battery, es, fresh, expected):
+    telemetry = PassiveTelemetry({}, es, battery, frozenset(fresh))
+    assert telemetry.charging_permitted is expected

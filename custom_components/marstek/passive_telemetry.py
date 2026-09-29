@@ -58,15 +58,19 @@ class PassiveTelemetry:
         )
 
     @property
-    def charging_permitted(self) -> bool:
-        """Recovery requires fresh, explicit permission and SOC below full."""
+    def charging_permitted(self) -> bool | None:
+        """Return fresh permission, prohibition, or None when evidence is missing."""
         if "battery" not in self.fresh:
-            return False
+            return None
         flag = self.battery.get("charg_flag")
         soc = numeric(self.battery.get("soc"))
         if soc is None and "es" in self.fresh:
             soc = numeric(self.es.get("bat_soc"))
-        return flag in (True, 1) and soc is not None and 0 <= soc < 100
+        if flag in (False, 0):
+            return False
+        if flag not in (True, 1) or soc is None:
+            return None
+        return 0 <= soc < 100
 
     def diagnostic_data(self) -> dict:
         """Retain endpoint provenance and raw counter units for later comparison."""

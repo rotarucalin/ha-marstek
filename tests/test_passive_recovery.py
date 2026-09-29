@@ -3,13 +3,19 @@
 import asyncio
 import json
 import logging
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import call
 
 import pytest
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from custom_components.marstek import MarstekDataUpdateCoordinator
-from custom_components.marstek.const import PASSIVE_SETTLE_SECONDS
+from custom_components.marstek.const import (
+    CONF_PASSIVE_KEEPALIVE_SECONDS,
+    PASSIVE_SETTLE_SECONDS,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -34,6 +40,9 @@ async def recovery(hass, marstek_entry, mock_marstek_api, monkeypatch, caplog, r
     """Start with an acknowledged, calibrated target."""
     desired = getattr(request, "param", -768)
     marstek_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        marstek_entry, options={CONF_PASSIVE_KEEPALIVE_SECONDS: 600}
+    )
     clock = SimpleNamespace(now=1000.0)
     monkeypatch.setattr("custom_components.marstek.monotonic", lambda: clock.now)
     caplog.set_level(logging.DEBUG, logger="custom_components.marstek")
@@ -209,31 +218,45 @@ async def test_missing_status_is_unknown_but_missing_mode_only_blocks_learning(
 
 @pytest.mark.parametrize("recovery", [-760, 340], indirect=True)
 @pytest.mark.parametrize(
-    "battery",
+    "battery,blocked",
     [
-        {"soc": 50, "charg_flag": False},
-        {"soc": 50, "charg_flag": 0},
-        {"soc": 100, "charg_flag": True},
-        {"soc": 50},
-        {"charg_flag": True},
-        None,
+        ({"soc": 50, "charg_flag": False}, True),
+        ({"soc": 50, "charg_flag": 0}, True),
+        ({"soc": 100, "charg_flag": True}, True),
+        ({"soc": 50}, False),
+        ({"soc": 50, "charg_flag": None}, False),
+        ({"charg_flag": True}, False),
+        (None, False),
     ],
 )
 async def test_zero_recovery_requires_fresh_charging_permission_only_for_charging(
-    recovery, battery, caplog
+    recovery, battery, blocked, caplog
 ):
     coordinator, api, _ = recovery
     api.get_es_status.return_value = {"ongrid_power": 0}
     api.get_es_mode.return_value = mode(0)
     api.get_battery_status.return_value = battery
+    keepalive = coordinator._passive_keepalive_cancel
+    generation = coordinator._passive_control_generation
     await coordinator.async_refresh()
     assert coordinator.passive_power_state == "sent"
     assert not coordinator._passive_samples
     if coordinator.desired_power < 0:
         api.set_es_mode_passive.assert_not_called()
-        assert coordinator._passive_keepalive_cancel is None
-        assert coordinator._passive_charge_recovery_blocked
-        assert observations(caplog)[-1]["phase"] == "recovery_blocked"
+        assert coordinator._passive_charge_recovery_blocked is blocked
+        if blocked:
+            assert coordinator._passive_keepalive_cancel is None
+            assert observations(caplog)[-1]["phase"] == "recovery_blocked"
+        else:
+            assert coordinator._passive_keepalive_cancel is keepalive
+            assert coordinator._passive_control_generation == generation
+            assert observations(caplog)[-1]["phase"] == "confirmation"
+            assert (
+                "Marstek passive recovery deferred: charging permission unknown; "
+                "preserving keepalive: device=Marstek Venus A "
+                f"desired_w={coordinator.desired_power} "
+                f"command_w={coordinator.command_power} keepalive_scheduled=True"
+            ) in caplog.text
     else:
         api.set_es_mode_passive.assert_called_once_with(coordinator.command_power)
         assert coordinator._passive_keepalive_cancel is not None
@@ -247,11 +270,12 @@ async def test_zero_recovery_requires_fresh_charging_permission_only_for_chargin
         assert events[-1]["preceding_command"]["source"] == "verification_retry"
 
 
-async def test_charging_permission_returning_allows_recovery(recovery):
+@pytest.mark.parametrize("flag", [False, None])
+async def test_charging_permission_returning_allows_recovery(recovery, flag):
     coordinator, api, _ = recovery
     api.get_es_status.return_value = status(0)
     api.get_es_mode.return_value = mode(0)
-    api.get_battery_status.return_value = {"soc": 50, "charg_flag": False}
+    api.get_battery_status.return_value = {"soc": 50, "charg_flag": flag}
     await coordinator.async_refresh()
     api.get_battery_status.return_value = {"soc": 50, "charg_flag": True}
     api.get_es_status.side_effect = [status(0), status(0), status(-768)]
@@ -456,3 +480,76 @@ async def test_fresh_reads_restore_acknowledged_after_communication_loss(
         api.set_es_mode_passive.assert_not_called()
     finally:
         cancel()
+
+
+@pytest.mark.parametrize("battery", [None, {"soc": 50, "charg_flag": None}])
+async def test_unknown_permission_preserves_original_keepalive_deadline(
+    recovery, hass, freezer, battery
+):
+    """An interruption cannot postpone or cancel the acknowledged command's timer."""
+    coordinator, api, clock = recovery
+    keepalive = coordinator._passive_keepalive_cancel
+    generation = coordinator._passive_control_generation
+    command = coordinator.command_power
+    api.get_es_status.return_value = status(0)
+    api.get_es_mode.return_value = mode(0)
+    api.get_battery_status.return_value = battery
+
+    # Repeated unknown observations span the original 600-second deadline.
+    for _ in range(2):
+        freezer.tick(timedelta(seconds=300))
+        await coordinator.async_refresh()
+        assert coordinator._passive_keepalive_cancel is keepalive
+        assert coordinator._passive_control_generation == generation
+        assert not coordinator._passive_charge_recovery_blocked
+        api.set_es_mode_passive.assert_not_called()
+
+    freezer.tick(timedelta(seconds=1))
+    clock.now += 1
+    async_fire_time_changed(hass, dt_util.utcnow())
+    await hass.async_block_till_done()
+
+    api.set_es_mode_passive.assert_called_once_with(command)
+    assert coordinator._last_passive_command["source"] == "keepalive"
+    assert coordinator._passive_keepalive_cancel is not None
+    assert coordinator._passive_keepalive_cancel is not keepalive
+    assert coordinator.desired_power == -768
+
+
+@pytest.mark.parametrize("flag", [False, True])
+async def test_stale_permission_cannot_cancel_keepalive(recovery, flag):
+    coordinator, api, _ = recovery
+    keepalive = coordinator._passive_keepalive_cancel
+    generation = coordinator._passive_control_generation
+    await coordinator._async_verify_passive_power(
+        mode(0),
+        es_data=status(0),
+        battery_data={"soc": 50, "charg_flag": flag},
+        fresh=frozenset({"es", "es_mode"}),
+        confirmed_drop=True,
+    )
+    api.set_es_mode_passive.assert_not_called()
+    assert coordinator._passive_keepalive_cancel is keepalive
+    assert coordinator._passive_control_generation == generation
+    assert not coordinator._passive_charge_recovery_blocked
+
+
+@pytest.mark.parametrize("battery", [None, {"soc": 50, "charg_flag": None}])
+async def test_unknown_permission_after_recovery_preserves_keepalive(
+    recovery, battery, caplog
+):
+    coordinator, api, _ = recovery
+    api.get_es_status.return_value = status(0)
+    api.get_es_mode.return_value = mode(0)
+    api.get_battery_status.side_effect = [
+        {"soc": 50, "charg_flag": True},
+        {"soc": 50, "charg_flag": True},
+        battery,
+    ]
+    await coordinator.async_refresh()
+    api.set_es_mode_passive.assert_called_once_with(coordinator.command_power)
+    assert coordinator._passive_keepalive_cancel is not None
+    assert not coordinator._passive_charge_recovery_blocked
+    assert coordinator.passive_power_state == "sent"
+    assert "recovery_blocked" not in [event["phase"] for event in observations(caplog)]
+    assert "charging permission unknown; preserving keepalive" in caplog.text

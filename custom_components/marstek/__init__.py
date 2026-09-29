@@ -1042,7 +1042,24 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             )
             if interrupted:
                 self._passive_samples.clear()
-                if self._passive_desired_power < 0 and not telemetry.charging_permitted:
+                if (
+                    self._passive_desired_power < 0
+                    and telemetry.charging_permitted is None
+                ):
+                    _LOGGER.debug(
+                        "Marstek passive recovery deferred: charging permission "
+                        "unknown; preserving keepalive: device=%s desired_w=%s "
+                        "command_w=%s keepalive_scheduled=%s",
+                        self.entry.title,
+                        self._passive_desired_power,
+                        self._passive_command_power,
+                        self._passive_keepalive_cancel is not None,
+                    )
+                    return False
+                if (
+                    self._passive_desired_power < 0
+                    and telemetry.charging_permitted is False
+                ):
                     if confirmed_drop or not allow_send:
                         self._passive_charge_recovery_blocked = True
                         self._cancel_passive_keepalive()
@@ -1057,7 +1074,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 confirmed
                 and self._passive_desired_power < 0
                 and self._passive_charge_recovery_blocked
-                and telemetry.charging_permitted
+                and telemetry.charging_permitted is True
             ):
                 self._passive_charge_recovery_blocked = False
                 self._schedule_passive_keepalive(source="keepalive")
@@ -1079,7 +1096,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 return False
 
             if self._passive_desired_power < 0:
-                if not telemetry.charging_permitted:
+                if telemetry.charging_permitted is not True:
                     return False
                 self._passive_charge_recovery_blocked = False
 

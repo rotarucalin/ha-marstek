@@ -74,6 +74,7 @@ SCAN_INTERVAL = timedelta(seconds=30)
 # EM is disabled only on an explicit CT disconnection, not on request failure.
 OPTIONAL_SECTIONS = frozenset({"ble"})
 PASSIVE_POWER_RETRY_SECONDS = 15
+PASSIVE_KEEPALIVE_RETRY_SECONDS = (30, 60, 90, 120)
 PASSIVE_POWER_TOLERANCE = 0.20
 PASSIVE_POWER_ZERO_TOLERANCE = 10
 
@@ -86,6 +87,7 @@ class PassiveCommandRetry:
     desired_w: int
     command_w: int
     source: str
+    delay_seconds: int = 0
     cancel: Callable[[], None] | None = None
 
 
@@ -221,6 +223,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._passive_control_generation = 0
         self._passive_keepalive_cancel: Callable[[], None] | None = None
         self._passive_retry: PassiveCommandRetry | None = None
+        self._passive_keepalive_retry_index = 0
         self._passive_command_in_flight = False
         self._passive_target_generation = 0
         self._passive_last_success_sequence = 0
@@ -445,6 +448,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._passive_target_generation += 1
         generation = self._passive_target_generation
         self._cancel_passive_retry()
+        self._reset_passive_keepalive_retry_backoff()
         self._cancel_passive_keepalive()
         async with self._io_gate.control(), self._passive_command_lock:
             if generation != self._passive_target_generation:
@@ -694,11 +698,17 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             if source != "keepalive":
                 _LOGGER.debug("Marstek command succeeded: %s", context)
         else:
-            next_action = (
-                f"retry in {PASSIVE_POWER_RETRY_SECONDS}s"
-                if mode == MODE_PASSIVE
-                else "passive control stopped; no automatic retry"
-            )
+            if mode == MODE_PASSIVE:
+                if source.removesuffix("_retry") == "keepalive":
+                    next_action = (
+                        "keepalive retry uses bounded backoff"
+                        if self._passive_desired_power != 0
+                        else "no keepalive retry for 0W target"
+                    )
+                else:
+                    next_action = f"retry in {PASSIVE_POWER_RETRY_SECONDS}s"
+            else:
+                next_action = "passive control stopped; no automatic retry"
             _LOGGER.warning(
                 "Marstek command failed: %s error=%s; %s", context, error, next_action
             )
@@ -727,6 +737,8 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             self._passive_command_in_flight = False
         if success:
             self._passive_last_success_sequence = self._passive_send_sequence
+            if source.removesuffix("_retry") == "keepalive":
+                self._reset_passive_keepalive_retry_backoff(log=True)
         if generation != self._passive_target_generation:
             return success
         self._passive_last_send_ok = success
@@ -773,26 +785,69 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             return True
         return False
 
-    def _schedule_passive_retry(self, source: str) -> None:
-        """Schedule just one retry, preserving the origin across failures."""
-        if self._passive_retry is not None:
-            return
-        self._require_mode_verification()
-        retry = PassiveCommandRetry(
-            self._passive_send_sequence,
-            self._passive_desired_power,
-            self._passive_command_power,
-            source if source == "verification_retry" else source.removesuffix("_retry"),
-        )
+    def _reset_passive_keepalive_retry_backoff(self, *, log: bool = False) -> None:
+        """Restart keepalive retry backoff from 30 seconds."""
+        if log and self._passive_keepalive_retry_index:
+            _LOGGER.debug(
+                "Marstek passive keepalive retry backoff reset after success: "
+                "device=%s",
+                self.entry.title,
+            )
+        self._passive_keepalive_retry_index = 0
+
+    def _arm_passive_retry(self, retry: PassiveCommandRetry, delay: int) -> None:
+        """Arm one retry callback without changing its provenance."""
+        retry.delay_seconds = delay
         self._passive_retry = retry
 
         async def async_retry(_now: datetime) -> None:
             await self._async_retry_passive_power(retry)
 
-        retry.cancel = async_call_later(
-            self.hass, PASSIVE_POWER_RETRY_SECONDS, async_retry
-        )
+        retry.cancel = async_call_later(self.hass, delay, async_retry)
         self._log_passive_recovery("retry scheduled", retry)
+
+    def _schedule_passive_retry(self, source: str) -> None:
+        """Schedule just one retry, preserving the origin across failures."""
+        if self._passive_retry is not None:
+            return
+        self._require_mode_verification()
+        original_source = (
+            source if source == "verification_retry" else source.removesuffix("_retry")
+        )
+        if original_source == "keepalive":
+            if self._passive_desired_power == 0:
+                _LOGGER.debug(
+                    "Marstek passive keepalive retry skipped for 0W target: device=%s",
+                    self.entry.title,
+                )
+                self._reset_passive_keepalive_retry_backoff()
+                return
+            index = min(
+                self._passive_keepalive_retry_index,
+                len(PASSIVE_KEEPALIVE_RETRY_SECONDS) - 1,
+            )
+            delay = PASSIVE_KEEPALIVE_RETRY_SECONDS[index]
+            self._passive_keepalive_retry_index = min(
+                index + 1, len(PASSIVE_KEEPALIVE_RETRY_SECONDS) - 1
+            )
+        else:
+            delay = PASSIVE_POWER_RETRY_SECONDS
+        retry = PassiveCommandRetry(
+            self._passive_send_sequence,
+            self._passive_desired_power,
+            self._passive_command_power,
+            original_source,
+        )
+        if original_source == "keepalive":
+            _LOGGER.debug(
+                "Marstek passive keepalive failed; next retry in %ss: "
+                "device=%s desired_w=%s command_w=%s",
+                delay,
+                self.entry.title,
+                self._passive_desired_power,
+                self._passive_command_power,
+            )
+        self._arm_passive_retry(retry, delay)
 
     def _cancel_passive_retry(self) -> None:
         """Cancel recovery, including a callback already waiting for the lock."""
@@ -816,6 +871,17 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 self._log_passive_recovery("stale retry discarded", retry)
                 return
             self._passive_retry = None
+            if retry.source == "keepalive" and self._polling.degraded:
+                delay = retry.delay_seconds or PASSIVE_KEEPALIVE_RETRY_SECONDS[0]
+                _LOGGER.debug(
+                    "Marstek passive keepalive retry suppressed because API is "
+                    "degraded: device=%s retry_in=%ss",
+                    self.entry.title,
+                    delay,
+                )
+                # No write happened: recheck later without advancing backoff.
+                self._arm_passive_retry(retry, delay)
+                return
             # Failed sends and their observations must not contribute samples
             # to calibration after recovery succeeds.
             self._passive_samples.clear()
@@ -831,8 +897,14 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             self._passive_command_changed_at = self._passive_last_send_at
 
     def _schedule_passive_keepalive(self, *, source: str) -> None:
-        """Restart normal maintenance after a successful command."""
+        """Restart normal maintenance for a non-zero Passive target."""
         self._cancel_passive_keepalive()
+        if self._passive_desired_power == 0:
+            _LOGGER.debug(
+                "Marstek passive keepalive disabled for 0W target: device=%s",
+                self.entry.title,
+            )
+            return
         generation = self._passive_control_generation
 
         async def async_keepalive(_now: datetime) -> None:
@@ -864,6 +936,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         """
         self._passive_target_generation += 1
         self._cancel_passive_retry()
+        self._reset_passive_keepalive_retry_backoff()
         self._passive_desired_power = None
         self._passive_command_power = None
         self._passive_command_source = SOURCE_DIRECT
@@ -886,6 +959,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             if (
                 generation != self._passive_control_generation
                 or self._passive_command_power is None
+                or self._passive_desired_power == 0
             ):
                 return
 

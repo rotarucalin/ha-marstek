@@ -398,9 +398,10 @@ interval. Reloading creates fresh schedules and immediately probes all eligible
 endpoints.
 
 Energy-meter polling (`EM.GetStatus`) also stops for the session after its first
-response explicitly reporting `ct_state: 0` (CT disconnected). CT Connected,
-Total Meter Power, and Phase A/B/C Power become unavailable immediately, and
-cached meter readings are discarded. Reload the integration or restart Home
+response explicitly reporting `ct_state: 0` (CT disconnected). That response is
+valid data, so CT Connected reports off and keeps doing so on later refreshes;
+Total Meter Power and Phase A/B/C Power become unavailable, since a disconnected
+CT has no meter power to report. Reload the integration or restart Home
 Assistant to probe the meter again after reconnecting the CT. Meter timeouts,
 API errors use endpoint backoff; only an
 explicit disconnected state disables this endpoint.

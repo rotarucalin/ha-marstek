@@ -201,7 +201,7 @@ async def test_reload_reprobes_sections_and_restores_entity_availability(
 async def test_ct_disconnection_stops_meter_queries(
     coordinator, mock_marstek_api, caplog, previously_connected, disconnected
 ):
-    """The first disconnected reading discards meter data and stops only EM."""
+    """The first disconnected reading is kept as data and stops only EM polling."""
     caplog.set_level(logging.INFO, logger="custom_components.marstek")
     fetcher = mock_marstek_api.get_em_status
     connected = {"ct_state": 1, "total_power": 90, "a_power": 10}
@@ -213,11 +213,13 @@ async def test_ct_disconnection_stops_meter_queries(
         assert (await coordinator._async_update_data())["em"] == connected
 
     preceding_calls = fetcher.call_count
-    fetcher.return_value = {**connected, "ct_state": disconnected}
+    disconnected_reading = {**connected, "ct_state": disconnected}
+    fetcher.return_value = disconnected_reading
     for cycle in range(3):
         data = await coordinator._async_update_data()
-        assert "em" not in data
-        assert "em" not in coordinator._last_good_data
+        # Later refreshes keep serving the final valid reading, unpolled.
+        assert data["em"] == disconnected_reading
+        assert coordinator._last_good_data["em"] == disconnected_reading
         assert "em" not in coordinator._missing_cycles
         assert coordinator._disabled_optional_sections == {"em"}
         assert fetcher.call_count == preceding_calls + 1
@@ -257,10 +259,46 @@ async def test_meter_requires_explicit_disconnected_state_to_stop(
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")
+@pytest.mark.parametrize(
+    ("response", "ct_connected", "meter_power"),
+    [
+        ({"ct_state": 1, "total_power": 90}, "on", "90"),
+        ({"ct_state": 0, "total_power": 0}, "off", "unavailable"),
+        # Timeout / no response: no data, so nothing is claimed either way.
+        (None, "unavailable", "unavailable"),
+    ],
+)
+async def test_ct_connected_entity_reflects_meter_response(
+    hass, marstek_entry, mock_marstek_api, response, ct_connected, meter_power
+):
+    """`ct_state == 0` is a valid "not connected" reading, unlike a timeout."""
+    marstek_entry.add_to_hass(hass)
+    mock_marstek_api.get_em_status.return_value = response
+    assert await hass.config_entries.async_setup(marstek_entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator = hass.data[DOMAIN][marstek_entry.entry_id]
+    registry = er.async_get(hass)
+    ct_id = registry.async_get_entity_id(
+        "binary_sensor", DOMAIN, f"{marstek_entry.unique_id}_ct_connected"
+    )
+    power_id = registry.async_get_entity_id(
+        "sensor", DOMAIN, f"{marstek_entry.unique_id}_em_total_power"
+    )
+    for _ in range(2):
+        assert hass.states.get(ct_id).state == ct_connected
+        assert hass.states.get(power_id).state == meter_power
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+    assert coordinator._disabled_optional_sections == (
+        {"em"} if response is not None and response["ct_state"] == 0 else set()
+    )
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
 async def test_reload_reprobes_disconnected_meter_and_restores_entities(
     hass, marstek_entry, mock_marstek_api
 ):
-    """CT and all meter power entities become unavailable, then recover on reload."""
+    """CT reports off, meter powers go unavailable, then all recover on reload."""
     marstek_entry.add_to_hass(hass)
     connected = {
         "ct_state": 1,
@@ -288,14 +326,20 @@ async def test_reload_reprobes_disconnected_meter_and_restores_entities(
         states[entity_id] = expected
         assert hass.states.get(entity_id).state == expected
 
+    ct_id = next(iter(states))
     mock_marstek_api.get_em_status.return_value = {**connected, "ct_state": 0}
     await coordinator.async_refresh()
     await hass.async_block_till_done()
-    for entity_id in states:
+    assert hass.states.get(ct_id).state == "off"
+    for entity_id in list(states)[1:]:
         assert hass.states.get(entity_id).state == "unavailable"
 
+    # EM is no longer polled, but CT Connected keeps reporting off.
     mock_marstek_api.get_em_status.return_value = connected
-    await coordinator.async_refresh()
+    for _ in range(2):
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+        assert hass.states.get(ct_id).state == "off"
     assert mock_marstek_api.get_em_status.call_count == 2
 
     assert await hass.config_entries.async_reload(marstek_entry.entry_id)

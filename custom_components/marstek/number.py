@@ -6,6 +6,7 @@ from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfPower
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import MarstekDataUpdateCoordinator
@@ -62,7 +63,12 @@ class MarstekPassivePowerNumber(MarstekEntity, NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         """Set new value."""
-        await self.coordinator.async_set_passive_power(int(value))
+        power = int(value)
+        if not await self.coordinator.async_set_passive_power(power):
+            raise HomeAssistantError(
+                f"Marstek could not set Passive power to {power} W for "
+                f"entity_id={self.entity_id}"
+            )
 
     @property
     def available(self) -> bool:

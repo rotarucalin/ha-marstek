@@ -310,6 +310,10 @@ class MarstekSensor(MarstekEntity, SensorEntity):
             return (
                 self.entity_description.value_fn(self.coordinator.data[key]) is not None
             )
+        if section_available and key == "em":
+            # EM polling stops after `ct_state == 0`; that final reading has no
+            # meaningful meter power to hold indefinitely.
+            return self.coordinator.data[key].get("ct_state") != 0
         return section_available
 
     @property

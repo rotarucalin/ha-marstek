@@ -315,22 +315,21 @@ async def test_new_target_supersedes_pending_retry(
 
 
 @pytest.mark.parametrize("mode", ["Auto", "AI"])
-@pytest.mark.parametrize("success", [True, False])
-async def test_select_stops_retries_even_if_mode_command_fails(
-    coordinator, command_timers, mock_marstek_api, caplog, mode, success
+async def test_select_success_stops_passive_retries(
+    coordinator, command_timers, mock_marstek_api, caplog, mode
 ):
-    """An intentional mode change cannot resurrect Passive, even on failure."""
+    """An accepted mode change cannot be resurrected by an old Passive retry."""
     mock_marstek_api.set_es_mode_passive.return_value = False
     await coordinator.async_set_passive_power(240)
     retry = command_timers.current
     command = getattr(mock_marstek_api, f"set_es_mode_{mode.lower()}")
-    command.return_value = success
+    command.return_value = True
     caplog.clear()
     with patch.object(
         coordinator, "async_request_refresh", new_callable=AsyncMock
     ) as refresh:
         await MarstekOperatingModeSelect(coordinator).async_select_option(mode)
-        assert refresh.await_count == int(success)
+        refresh.assert_awaited_once()
     assert not command_timers.active
     assert coordinator._passive_desired_power is None
     assert coordinator.passive_power_state == "unknown"
@@ -340,8 +339,101 @@ async def test_select_stops_retries_even_if_mode_command_fails(
     mock_marstek_api.set_es_mode_passive.assert_called_once_with(240)
     command.assert_called_once_with()
     assert f"source=operating_mode_select method=ES.SetMode mode={mode}" in caplog.text
-    failures = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert len(failures) == int(not success)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize("mode", ["Auto", "AI"])
+async def test_select_failure_raises_and_keeps_passive_control(
+    coordinator, command_timers, mock_marstek_api, caplog, mode
+):
+    """A rejected Auto/AI selection is HA-visible and leaves Passive running."""
+    await coordinator.async_set_passive_power(240)
+    keepalive = command_timers.current
+    command = getattr(mock_marstek_api, f"set_es_mode_{mode.lower()}")
+    command.return_value = False
+    caplog.clear()
+    with patch.object(
+        coordinator, "async_request_refresh", new_callable=AsyncMock
+    ) as refresh:
+        with pytest.raises(HomeAssistantError, match=f"operating mode {mode} "):
+            await MarstekOperatingModeSelect(coordinator).async_select_option(mode)
+        refresh.assert_not_awaited()
+    command.assert_called_once_with()
+    assert f"source=operating_mode_select method=ES.SetMode mode={mode}" in caplog.text
+    assert command_timers.active == [keepalive]
+    assert coordinator._passive_desired_power == 240
+    assert coordinator._passive_command_power == 240
+
+
+@pytest.mark.parametrize("mode", ["Auto", "AI"])
+async def test_auto_ai_failure_leaves_active_passive_control_untouched(
+    coordinator, command_timers, mock_marstek_api, mode
+):
+    """A device-rejected Auto/AI command must not abandon the Passive session."""
+    await coordinator.async_set_passive_power(240)
+    keepalive = command_timers.current
+    state_before = coordinator.passive_power_state
+    last_command_before = dict(coordinator._last_passive_command)
+    sequence_before = coordinator._passive_send_sequence
+    last_send_at_before = coordinator._passive_last_send_at
+    generation_before = coordinator._passive_control_generation
+    target_generation_before = coordinator._passive_target_generation
+    getattr(mock_marstek_api, f"set_es_mode_{mode.lower()}").return_value = False
+
+    with patch.object(coordinator, "_clear_passive_control") as clear_mock:
+        assert not await coordinator.async_set_operating_mode(mode)
+        clear_mock.assert_not_called()
+
+    # The same timer, not a cancelled-and-rescheduled replacement, is still due.
+    assert command_timers.active == [keepalive]
+    assert coordinator._passive_keepalive_cancel is not None
+    assert coordinator._passive_desired_power == 240
+    assert coordinator._passive_command_power == 240
+    assert coordinator.passive_power_state == state_before
+    assert coordinator._passive_control_generation == generation_before
+    assert coordinator._passive_target_generation == target_generation_before
+    # Provenance still describes the Passive command, not the failed attempt.
+    assert coordinator._last_passive_command == last_command_before
+    assert coordinator._passive_send_sequence == sequence_before
+    assert coordinator._passive_last_send_at == last_send_at_before
+
+    # The countdown itself still refreshes normally afterwards.
+    mock_marstek_api.set_es_mode_passive.reset_mock()
+    await keepalive.fire()
+    mock_marstek_api.set_es_mode_passive.assert_called_once_with(240)
+    assert command_timers.current.delay == 180
+
+
+@pytest.mark.parametrize("mode", ["Auto", "AI"])
+async def test_clear_passive_control_runs_only_after_auto_ai_command_succeeds(
+    coordinator, command_timers, mock_marstek_api, mode
+):
+    """`_clear_passive_control` must never run before the API call returns."""
+    await coordinator.async_set_passive_power(240)
+    order = []
+    original_clear = coordinator._clear_passive_control
+
+    def record_clear():
+        order.append("clear_passive_control")
+        return original_clear()
+
+    def record_api_call(*_args, **_kwargs):
+        # Passive state is still intact while the device is being asked.
+        assert coordinator._passive_desired_power == 240
+        assert command_timers.active
+        order.append("api_call")
+        return True
+
+    command = getattr(mock_marstek_api, f"set_es_mode_{mode.lower()}")
+    command.side_effect = record_api_call
+    with patch.object(coordinator, "_clear_passive_control", side_effect=record_clear):
+        assert await coordinator.async_set_operating_mode(mode)
+
+    assert order == ["api_call", "clear_passive_control"]
+    assert not command_timers.active
+    assert coordinator._passive_desired_power is None
+    assert coordinator._last_passive_command["mode"] == mode
+    assert coordinator._last_passive_command["success"] is True
 
 
 async def test_selecting_manual_never_sends_a_command_and_leaves_passive_alone(
@@ -692,12 +784,46 @@ async def test_number_keeps_requested_target_separate_from_measured_output(
     number = MarstekPassivePowerNumber(coordinator)
     coordinator.data = {"es_mode": {"mode": "Passive", "ongrid_power": 215}}
     mock_marstek_api.set_es_mode_passive.return_value = False
-    await number.async_set_native_value(300)
+    with pytest.raises(HomeAssistantError):
+        await number.async_set_native_value(300)
     assert coordinator._passive_desired_power == 300
     assert number.native_value == 300
     assert "source=new_target" in outgoing_messages(caplog)[0]
     coordinator.data = {"es_mode": {"mode": "Auto", "ongrid_power": 215}}
     assert number.native_value is None
+
+
+async def test_number_failure_raises_home_assistant_error(
+    coordinator, command_timers, mock_marstek_api, caplog
+):
+    """A rejected Passive Power write is HA-visible; provenance is still logged."""
+    number = MarstekPassivePowerNumber(coordinator)
+    number.entity_id = "number.marstek_passive_mode_power"
+    mock_marstek_api.set_es_mode_passive.return_value = False
+    with pytest.raises(
+        HomeAssistantError,
+        match="Passive power to 300 W for entity_id=number.marstek_passive_mode_power",
+    ):
+        await number.async_set_native_value(300)
+    mock_marstek_api.set_es_mode_passive.assert_called_once_with(300)
+    assert "source=new_target" in outgoing_messages(caplog)[0]
+    assert coordinator._last_passive_command["success"] is False
+    # The existing bounded retry still owns recovery; nothing marks it sent OK.
+    assert not coordinator._passive_last_send_ok
+    assert coordinator._passive_retry is not None
+    assert command_timers.current.delay == PASSIVE_POWER_RETRY_SECONDS
+
+
+async def test_number_success_does_not_raise(
+    coordinator, command_timers, mock_marstek_api
+):
+    number = MarstekPassivePowerNumber(coordinator)
+    mock_marstek_api.set_es_mode_passive.return_value = True
+    await number.async_set_native_value(300)
+    mock_marstek_api.set_es_mode_passive.assert_called_once_with(300)
+    assert coordinator._passive_desired_power == 300
+    assert coordinator._last_passive_command["success"] is True
+    assert command_timers.current.delay == DEFAULT_PASSIVE_KEEPALIVE_SECONDS
 
 
 # --- Adaptive passive-power compensation -----------------------------------

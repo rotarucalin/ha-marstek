@@ -515,9 +515,23 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             if mode == MODE_PASSIVE:
                 return True
 
-            self._clear_passive_control()
+            # As for Manual: Passive state is only torn down once the device
+            # has accepted the new mode, and a failed attempt's shared
+            # send bookkeeping is undone so it cannot leak into Passive.
+            sequence_before = self._passive_send_sequence
+            last_command_before = self._last_passive_command
+            last_send_at_before = self._passive_last_send_at
 
-            return await self._async_send_mode_command(mode=mode, source=source)
+            success = await self._async_send_mode_command(mode=mode, source=source)
+
+            if success:
+                self._clear_passive_control()
+            else:
+                self._passive_send_sequence = sequence_before
+                self._last_passive_command = last_command_before
+                self._passive_last_send_at = last_send_at_before
+
+            return success
 
     async def async_set_manual_schedule(
         self,
@@ -1473,7 +1487,9 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
     async def _fetch_section(self, key: str, fetcher, *, verification: bool = False):
         """Fetch one section and track consecutive misses."""
         if key in self._disabled_optional_sections:
-            return None
+            # A failed optional section has no cached data; EM disabled by an
+            # explicit `ct_state == 0` keeps that final valid reading.
+            return self._last_good_data.get(key)
         self._fresh_sections.discard(key)
         if key == "es_mode":
             self._polling.mode_interval(self._passive_is_stable(), monotonic())
@@ -1510,15 +1526,18 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             )
 
         if key == "em" and isinstance(result, dict) and result.get("ct_state") == 0:
+            # `ct_state == 0` is valid data ("CT not connected"), not a failed
+            # read: keep it so CT Connected reports off, then stop polling.
             self._disabled_optional_sections.add(key)
-            self._last_good_data.pop(key, None)
+            self._fresh_sections.add(key)
+            self._last_good_data[key] = result
             self._missing_cycles.pop(key, None)
             _LOGGER.info(
                 "Marstek energy meter reports CT disconnected; skipping it until "
                 "integration reload or Home Assistant restart: device=%s",
                 self.entry.title,
             )
-            return None
+            return result
 
         if result is not None:
             self._fresh_sections.add(key)

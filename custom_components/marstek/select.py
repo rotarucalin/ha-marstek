@@ -64,3 +64,7 @@ class MarstekOperatingModeSelect(MarstekEntity, SelectEntity):
                 "marstek.set_operating_mode_manual service instead of the "
                 "Operating Mode selector"
             )
+        raise HomeAssistantError(
+            f"Marstek could not set operating mode {option} for "
+            f"entity_id={self.entity_id}"
+        )

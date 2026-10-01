@@ -139,7 +139,7 @@ zero. The old generic Solar Voltage and Solar Current mappings are removed.
 - `sensor.marstek_battery_power` - Battery charge/discharge power (W)
 - `sensor.marstek_grid_power` - Grid import/export power (W)
 - `sensor.marstek_off_grid_power` - Off-grid power usage (W)
-- `sensor.marstek_total_solar_energy` - Cumulative solar generation (Wh)
+- `sensor.marstek_total_solar_energy` - Cumulative solar generation (kWh; `ES.GetStatus` `total_pv_energy` ÷ 100). Earlier versions published the raw count as Wh; see [CHANGELOG.md](CHANGELOG.md) for the statistics impact
 - `sensor.marstek_total_grid_output_energy` - Cumulative grid export (Wh)
 - `sensor.marstek_total_grid_input_energy` - Cumulative grid import (Wh)
 - `sensor.marstek_total_load_energy` - Cumulative load consumption (Wh)
@@ -157,10 +157,16 @@ zero. The old generic Solar Voltage and Solar Current mappings are removed.
 
 ### Binary Sensors
 
-- `binary_sensor.marstek_battery_charging` - Battery charging status
-- `binary_sensor.marstek_battery_discharging` - Battery discharging status
+- `binary_sensor.marstek_battery_charging` - **Charging Allowed**: on when the device currently permits charging (`charg_flag`)
+- `binary_sensor.marstek_battery_discharging` - **Discharging Allowed**: on when the device currently permits discharging (`dischrg_flag`)
 - `binary_sensor.marstek_bluetooth_connected` - Bluetooth connection status
 - `binary_sensor.marstek_ct_connected` - CT sensor connection status
+
+Charging Allowed and Discharging Allowed are permission flags, not activity.
+"On" does not mean the battery is currently charging or discharging. Use the
+sign of `sensor.marstek_battery_power` for that. Installations that already have
+these entities keep their entity IDs (shown above). New installations derive
+the entity IDs from the new names.
 
 ### Controls
 

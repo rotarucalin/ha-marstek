@@ -85,7 +85,9 @@ be null.
 | `rated_capacity` | number or null | Rated capacity, Wh |
 
 The two permission flags matter for passive control. A device that refuses the
-requested direction is constrained, not miscalibrated.
+requested direction is constrained, not miscalibrated. The integration exposes
+them as the "Charging Allowed" and "Discharging Allowed" binary sensors, which
+carry no device class. They say nothing about whether power is actually flowing.
 
 ### 3.5 PV — only for Venus A and Venus D
 
@@ -117,8 +119,10 @@ Three methods: `ES.GetStatus`, `ES.SetMode`, `ES.GetMode`.
 `total_load_energy` (Wh). All may be null.
 
 Note the unit on `total_pv_energy`: the specification says `0.01*KWh`, which is
-10 Wh per count, not 1 Wh. The integration currently publishes it as Wh.
-Treat any scaling change here as a breaking statistics change.
+10 Wh per count, not 1 Wh. The integration publishes it in kWh as `raw / 100`
+(raw 100 is 1.0 kWh). Earlier versions published the raw count labelled as Wh,
+which was 10× too low. That correction broke long-term statistics; see
+`CHANGELOG.md`. The other ES energy counters are published unchanged in Wh.
 
 #### ES.SetMode
 

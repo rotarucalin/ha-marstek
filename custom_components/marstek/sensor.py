@@ -40,6 +40,14 @@ def _total_pv_power(data: dict) -> StateType:
     return sum(available_powers) if available_powers else None
 
 
+def _es_total_pv_energy_kwh(data: dict) -> StateType:
+    """Convert ES.GetStatus total_pv_energy, documented in 0.01 kWh units."""
+    raw = data.get("total_pv_energy")
+    if raw is None:
+        return None
+    return raw / 100
+
+
 @dataclass
 class MarstekSensorEntityDescription(SensorEntityDescription):
     """Describes Marstek sensor entity."""
@@ -163,11 +171,11 @@ SENSOR_TYPES: tuple[MarstekSensorEntityDescription, ...] = (
     MarstekSensorEntityDescription(
         key="es_total_pv_energy",
         name="Total Solar Energy",
-        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.TOTAL_INCREASING,
         data_key="es",
-        value_fn=lambda data: data.get("total_pv_energy"),
+        value_fn=_es_total_pv_energy_kwh,
     ),
     MarstekSensorEntityDescription(
         key="es_total_grid_output",

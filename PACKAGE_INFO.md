@@ -86,7 +86,7 @@ logs its name once.
 - Battery Power (W)
 - Grid Power (W)
 - Off-Grid Power (W)
-- Total Solar Energy (Wh)
+- Total Solar Energy (kWh)
 - Total Grid Output Energy (Wh)
 - Total Grid Input Energy (Wh)
 - Total Load Energy (Wh)
@@ -102,8 +102,8 @@ logs its name once.
 - WiFi Signal Strength (dBm)
 
 ### Binary Sensors (4 total)
-- Battery Charging
-- Battery Discharging
+- Charging Allowed (permission flag, not activity)
+- Discharging Allowed (permission flag, not activity)
 - Bluetooth Connected
 - CT Connected
 

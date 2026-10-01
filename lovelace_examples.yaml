@@ -39,9 +39,9 @@ cards:
       - entity: number.marstek_passive_power
         name: Passive Power Setting
       - entity: binary_sensor.marstek_battery_charging
-        name: Charging
+        name: Charging Allowed
       - entity: binary_sensor.marstek_battery_discharging
-        name: Discharging
+        name: Discharging Allowed
 
   # Energy Statistics
   - type: entities

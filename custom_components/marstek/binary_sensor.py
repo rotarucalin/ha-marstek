@@ -31,16 +31,16 @@ class MarstekBinarySensorEntityDescription(BinarySensorEntityDescription):
 
 
 BINARY_SENSOR_TYPES: tuple[MarstekBinarySensorEntityDescription, ...] = (
+    # charg_flag/dischrg_flag are permission flags, not activity; legacy keys keep unique IDs.
     MarstekBinarySensorEntityDescription(
         key="battery_charging",
-        name="Battery Charging",
-        device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
+        name="Charging Allowed",
         data_key="battery",
         value_fn=lambda data: data.get("charg_flag"),
     ),
     MarstekBinarySensorEntityDescription(
         key="battery_discharging",
-        name="Battery Discharging",
+        name="Discharging Allowed",
         data_key="battery",
         value_fn=lambda data: data.get("dischrg_flag"),
     ),

@@ -56,8 +56,9 @@ async def test_four_pv_channels(hass, marstek_entry, mock_marstek_api, pv_status
     assert power.attributes["unit_of_measurement"] == "W"
     assert power.attributes["device_class"] == "power"
     assert power.attributes["state_class"] == "measurement"
-    # ES.GetStatus has its own energy total; preserve its source and identity.
-    assert sensor_state(hass, marstek_entry, "es_total_pv_energy").state == "4321"
+    # ES.GetStatus has its own energy total (0.01 kWh units); preserve its source
+    # and identity.
+    assert sensor_state(hass, marstek_entry, "es_total_pv_energy").state == "43.21"
     for key in ("pv_voltage", "pv_current"):
         assert (
             er.async_get(hass).async_get_entity_id(

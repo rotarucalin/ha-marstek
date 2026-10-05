@@ -1311,6 +1311,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         )
         # Missing/failed reads must never cause extra confirmation traffic.
         if suspect and "es" in fresh:
+            self._polling.request_active(monotonic())
             self._passive_samples.clear()
             self._set_passive_power_state(
                 PASSIVE_STATE_UNKNOWN
@@ -1445,8 +1446,16 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             raise
 
     def _require_mode_verification(self) -> None:
+        """Every ES.SetMode, non-acknowledged state and retry passes through here."""
         self._mode_verification_required = True
         self._polling.require_mode(monotonic())
+        self._polling.request_active(monotonic())
+
+    def _control_settled(self) -> bool:
+        """Mode verified and, under Passive, the output confirmed stable."""
+        if self._mode_verification_required:
+            return False
+        return self._passive_desired_power is None or self._passive_is_stable()
 
     def _check_es_freshness(self) -> None:
         """An ES outage requests verification once, not on every skipped poll."""
@@ -1491,10 +1500,9 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             # explicit `ct_state == 0` keeps that final valid reading.
             return self._last_good_data.get(key)
         self._fresh_sections.discard(key)
-        if key == "es_mode":
-            self._polling.mode_interval(self._passive_is_stable(), monotonic())
-            if self._mode_verification_required:
-                self._polling.require_mode(monotonic())
+        self._polling.update_profile(self._control_settled(), monotonic())
+        if key == "es_mode" and self._mode_verification_required:
+            self._polling.require_mode(monotonic())
         critical = verification or (
             key == "es_mode" and self._mode_verification_required
         )

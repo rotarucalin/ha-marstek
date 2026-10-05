@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### Changed: Much lower read polling, with a temporary fast profile for control
+
+The Venus firmware stays unreliable under Open API read load, so normal polling
+is reduced by about 70% (from about 490 to about 144 requests per hour):
+
+| Endpoint | Before | Normal | Active |
+| --- | --- | --- | --- |
+| `ES.GetStatus` | 30 s | 60 s | 30 s |
+| `ES.GetMode` | 60 s (300 s in stable Passive) | 120 s | 30 s |
+| `Bat.GetStatus` | 60 s | 180 s | 60 s |
+| `PV.GetStatus` | 60 s | 300 s | — |
+| `EM.GetStatus` | 60 s | 300 s | — |
+| `Wifi.GetStatus` | 300 s | 900 s | — |
+| `BLE.GetStatus` | 30 s | 600 s | — |
+
+The active profile starts after any `ES.SetMode` (successful or failed), a
+Passive verification mismatch, a suspected physical interruption, or Passive
+retry activity. It ends once the mode is verified and, under Passive, the output
+is acknowledged and stable, or at most 300 seconds after the last such event.
+It never sends commands of its own. Endpoint backoff and degraded API mode take
+precedence over both profiles.
+
+Other effects:
+
+- ES telemetry now counts as stale after 120 seconds instead of 60, matching
+  the slower ES cadence.
+- Dashboard values for battery, PV, meter and diagnostics update less often.
+- Passive calibration learns more slowly, because it needs ES, mode and battery
+  readings from the same cycle.
+- The BLE failure-backoff cap rises from 300 to 600 seconds.
+- Debug poll logs now include `effective_interval` and `profile=normal|active`.
+
+Request pacing, request-ID validation, keepalive/retry logic, calibration
+rules, services and entities are unchanged.
+
 ### Fixed: Total Solar Energy scaling (statistics-affecting)
 
 `sensor.marstek_total_solar_energy` (unique ID suffix `es_total_pv_energy`)

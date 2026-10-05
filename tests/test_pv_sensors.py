@@ -8,6 +8,7 @@ from homeassistant.helpers import entity_registry as er
 
 from custom_components.marstek.const import DOMAIN
 from custom_components.marstek.marstek_api import MarstekAPI
+from custom_components.marstek.polling import ENDPOINTS
 
 pytestmark = pytest.mark.usefixtures("enable_custom_integrations")
 
@@ -126,7 +127,7 @@ async def test_channel_data_disappears_and_recovers(
     assert float(sensor_state(hass, marstek_entry, "pv_power").state) == 257.5
 
     mock_marstek_api.get_pv_status.return_value = pv_status
-    poll_time += 60
+    poll_time += ENDPOINTS["pv"][1]
     await coordinator.async_refresh()
     await hass.async_block_till_done()
     assert sensor_state(hass, marstek_entry, "pv1_power").state == "120"

@@ -10,23 +10,32 @@ from dataclasses import dataclass
 
 _LOGGER = logging.getLogger(__name__)
 
-# BLE retains its existing cadence and unsupported-endpoint handling.
+# Normal-profile interval and failure backoff cap. The Venus firmware degrades
+# under read load, so everything not needed for control is polled slowly.
 ENDPOINTS = {
-    "es": ("ES.GetStatus", 30, 180),
-    "es_mode": ("ES.GetMode", 60, 300),
-    "battery": ("Bat.GetStatus", 60, 300),
-    "em": ("EM.GetStatus", 60, 300),
-    "pv": ("PV.GetStatus", 60, 300),
-    "wifi": ("Wifi.GetStatus", 300, 900),
-    "ble": ("BLE.GetStatus", 30, 300),
+    "es": ("ES.GetStatus", 60, 180),
+    "es_mode": ("ES.GetMode", 120, 300),
+    "battery": ("Bat.GetStatus", 180, 300),
+    "em": ("EM.GetStatus", 300, 300),
+    "pv": ("PV.GetStatus", 300, 300),
+    "wifi": ("Wifi.GetStatus", 900, 900),
+    "ble": ("BLE.GetStatus", 600, 600),
 }
+# Active control/recovery profile: only control telemetry is polled faster.
+# It ends once control is settled, or this long after the last trigger so an
+# output that can never be confirmed (e.g. charging refused) is not polled fast.
+ACTIVE_INTERVALS = {"es": 30, "es_mode": 30, "battery": 60}
+ACTIVE_PROFILE_MAX_SECONDS = 300
+PROFILE_NORMAL = "normal"
+PROFILE_ACTIVE = "active"
 HEALTH_WINDOW = 120
 HEALTH_FAILURE_ENDPOINTS = 3
 HEALTH_RECOVERY_SUCCESSES = 3
 HEALTH_RECOVERY_SECONDS = 60
 HEALTH_PROBE_INTERVAL = 120
-PASSIVE_MODE_INTERVAL = 300
-ES_FRESH_SECONDS = 60
+# Normal ES reads land on coordinator ticks, so a reading may be a little older
+# than its interval when used; tolerate one missed normal read before stale.
+ES_FRESH_SECONDS = 2 * ENDPOINTS["es"][1]
 
 
 @dataclass
@@ -35,6 +44,7 @@ class SectionSchedule:
 
     interval: float
     cap: float
+    active_interval: float | None = None
     last_success: float | None = None
     next_poll: float = 0
     consecutive_failures: int = 0
@@ -59,8 +69,12 @@ class PollingPolicy:
             cap = (backoff_caps or {}).get(key, cap)
             if interval <= 0 or cap < interval:
                 raise ValueError(f"Invalid polling interval/backoff cap for {key}")
-            self.sections[key] = SectionSchedule(interval, cap)
-        self.normal_mode_interval = self.sections["es_mode"].interval
+            active = ACTIVE_INTERVALS.get(key)
+            self.sections[key] = SectionSchedule(
+                interval, cap, None if active is None else min(active, interval)
+            )
+        self.profile = PROFILE_NORMAL
+        self._active_since: float | None = None
         self.degraded = False
         self.next_probe = 0.0
         self._failures: deque[tuple[float, str]] = deque()
@@ -73,18 +87,38 @@ class PollingPolicy:
         if not state.consecutive_failures:
             state.next_poll = min(state.next_poll, now)
 
-    def mode_interval(self, stable: bool, now: float) -> None:
-        state = self.sections["es_mode"]
-        interval = (
-            max(PASSIVE_MODE_INTERVAL, self.normal_mode_interval)
-            if stable
-            else self.normal_mode_interval
+    def effective_interval(self, key: str) -> float:
+        state = self.sections[key]
+        if self.profile == PROFILE_ACTIVE and state.active_interval is not None:
+            return state.active_interval
+        return state.interval
+
+    def request_active(self, now: float) -> None:
+        """A command or recovery event (re)starts the bounded active window."""
+        self._active_since = now
+
+    def update_profile(self, settled: bool, now: float) -> None:
+        if settled:
+            self._active_since = None
+        self.set_profile(
+            self._active_since is not None
+            and now - self._active_since < ACTIVE_PROFILE_MAX_SECONDS
         )
-        if state.interval == interval:
+
+    def set_profile(self, active: bool) -> None:
+        """Re-time successful deadlines; failure backoff and health are untouched."""
+        profile = PROFILE_ACTIVE if active else PROFILE_NORMAL
+        if profile == self.profile:
             return
-        state.interval = interval
-        if not state.consecutive_failures and state.last_success is not None:
-            state.next_poll = state.last_success + interval if stable else now
+        self.profile = profile
+        _LOGGER.debug(
+            "Marstek polling profile: device=%s profile=%s", self.device, profile
+        )
+        for key, state in self.sections.items():
+            if state.active_interval is None or state.consecutive_failures:
+                continue
+            if state.last_success is not None:
+                state.next_poll = state.last_success + self.effective_interval(key)
 
     def due(self, key: str, now: float, *, verification: bool = False) -> bool:
         state = self.sections[key]
@@ -104,6 +138,8 @@ class PollingPolicy:
                 reason = "API probe interval"
         diagnostic = (
             state.interval,
+            self.effective_interval(key),
+            self.profile,
             state.consecutive_failures,
             state.backoff_interval,
             self.degraded,
@@ -113,11 +149,14 @@ class PollingPolicy:
         if diagnostic != state.diagnostic_state:
             _LOGGER.debug(
                 "Marstek poll: device=%s endpoint=%s normal_interval=%ss "
+                "effective_interval=%ss profile=%s "
                 "failure_count=%s backoff_interval=%ss API_health=%s "
                 "next_eligible_poll=%s skip_reason=%s",
                 self.device,
                 ENDPOINTS[key][0],
                 state.interval,
+                self.effective_interval(key),
+                self.profile,
                 state.consecutive_failures,
                 state.backoff_interval,
                 "degraded" if self.degraded else "healthy",
@@ -134,7 +173,7 @@ class PollingPolicy:
             state.last_success = now
             state.consecutive_failures = 0
             state.backoff_interval = 0
-            state.next_poll = now + state.interval
+            state.next_poll = now + self.effective_interval(key)
         else:
             state.consecutive_failures += 1
             state.backoff_interval = min(

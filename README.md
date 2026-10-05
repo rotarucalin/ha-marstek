@@ -360,17 +360,30 @@ The coordinator still wakes every 30 seconds, but only queries endpoints that
 are due. Deadlines start when a request finishes; the next coordinator update
 after that deadline performs the read. Skipped reads retain cached values.
 
-| Endpoint | Normal interval | Failure-backoff cap |
-| --- | --- | --- |
-| `ES.GetStatus` | 30 seconds | 180 seconds |
-| `ES.GetMode` | 60 seconds | 300 seconds |
-| `Bat.GetStatus` | 60 seconds | 300 seconds |
-| `EM.GetStatus` | 60 seconds | 300 seconds |
-| `PV.GetStatus` | 60 seconds | 300 seconds |
-| `Wifi.GetStatus` | 300 seconds | 900 seconds |
+The Venus firmware becomes unreliable under read load, so endpoints that are not
+needed for control are polled slowly:
 
-A failure doubles that endpoint's interval, with further failures doubling it
-again up to its cap. Success resets its failure count and normal interval.
+| Endpoint | Normal interval | Active interval | Failure-backoff cap |
+| --- | --- | --- | --- |
+| `ES.GetStatus` | 60 seconds | 30 seconds | 180 seconds |
+| `ES.GetMode` | 120 seconds | 30 seconds | 300 seconds |
+| `Bat.GetStatus` | 180 seconds | 60 seconds | 300 seconds |
+| `EM.GetStatus` | 300 seconds | — | 300 seconds |
+| `PV.GetStatus` | 300 seconds | — | 300 seconds |
+| `Wifi.GetStatus` | 900 seconds | — | 900 seconds |
+| `BLE.GetStatus` | 600 seconds | — | 600 seconds |
+
+The active control/recovery profile starts after any `ES.SetMode` (successful or
+failed), a Passive verification mismatch, a suspected physical interruption, or
+Passive retry activity. It ends once the mode is verified and, under Passive, the
+output is acknowledged and stable, or at most 300 seconds after the last such
+event, so an output that can never be confirmed (for example, charging refused)
+is not polled fast indefinitely. The profile never sends commands itself. Debug
+poll logs show `normal_interval`, `effective_interval`, and `profile`.
+
+A failure doubles that endpoint's normal interval, with further failures doubling it
+again up to its cap, in either profile. Success resets its failure count and
+returns it to the current profile's interval.
 PV is queried only on supported models and now recovers automatically after
 timeouts. Intervals and caps can be overridden per coordinator through its
 `poll_intervals` and `backoff_caps` constructor mappings (section keys in
@@ -383,19 +396,17 @@ Passive retries, keepalives, and necessary verification remain available.
 Recovery requires at least three consecutive successful communications spanning
 at least 60 seconds; a failure restarts that recovery count. Both health
 transitions and scheduling changes are logged at DEBUG. Each device has its own
-health and scheduling state.
+health and scheduling state. Degraded mode applies in both profiles.
 
-When Passive is acknowledged, recent ES telemetry is valid, no recovery is
-pending, and the API is healthy, `ES.GetMode` slows to five minutes. Unknown
-verification, stale/failed ES telemetry, commands, or recovery remove this longer
-deadline, without bypassing endpoint failure backoff. Cached mode data never
-acknowledges a new command.
+Unknown verification, stale/failed ES telemetry (older than 120 seconds),
+commands, or recovery request an `ES.GetMode` verification read, without
+bypassing endpoint failure backoff. Cached mode data never acknowledges a new
+command.
 
 Bluetooth retains its existing optional-endpoint behavior: a failed
 `BLE.GetStatus` disables it until integration reload or Home Assistant restart.
-Its cached values are discarded. Successful BLE reads remain on a 30-second
-interval. Reloading creates fresh schedules and immediately probes all eligible
-endpoints.
+Its cached values are discarded. Reloading creates fresh schedules and
+immediately probes all eligible endpoints.
 
 Energy-meter polling (`EM.GetStatus`) also stops for the session after its first
 response explicitly reporting `ct_state: 0` (CT disconnected). That response is

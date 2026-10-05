@@ -34,6 +34,7 @@ from custom_components.marstek.const import (
     SOURCE_CALIBRATION,
 )
 from custom_components.marstek.number import MarstekPassivePowerNumber
+from custom_components.marstek.polling import ES_FRESH_SECONDS
 from custom_components.marstek.select import MarstekOperatingModeSelect
 from custom_components.marstek.sensor import MarstekPassivePowerStateSensor
 from custom_components.marstek.services import async_register_services
@@ -1557,7 +1558,10 @@ async def test_successful_keepalive_preserves_acknowledgement_without_mode(
 
 
 @pytest.mark.parametrize("action", ["poll", "keepalive"])
-@pytest.mark.parametrize("age,expected", [(60, "acknowledged"), (61, "unknown")])
+@pytest.mark.parametrize(
+    "age,expected",
+    [(ES_FRESH_SECONDS, "acknowledged"), (ES_FRESH_SECONDS + 1, "unknown")],
+)
 async def test_cached_output_expires_independently_of_mode(
     coordinator, mock_marstek_api, command_timers, clock, action, age, expected
 ):
@@ -1565,8 +1569,11 @@ async def test_cached_output_expires_independently_of_mode(
     mock_marstek_api.get_es_mode.return_value = {"mode": "Auto", "ongrid_power": 240}
     await coordinator.async_set_passive_power(240)
     await coordinator.async_refresh()
-    # Simulate an intentional ES polling skip rather than a new measurement.
-    coordinator._polling.sections["es"].next_poll = clock() + 300
+    # Simulate an intentional ES polling skip rather than a new measurement,
+    # in either polling profile.
+    es = coordinator._polling.sections["es"]
+    es.interval = es.active_interval = 1000
+    es.next_poll = clock() + 1000
     clock.advance(age)
     if action == "poll":
         await coordinator.async_refresh()

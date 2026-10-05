@@ -7,8 +7,10 @@ from homeassistant.helpers import entity_registry as er
 
 from custom_components.marstek import MarstekDataUpdateCoordinator
 from custom_components.marstek.const import DOMAIN
+from custom_components.marstek.polling import ENDPOINTS
 
 pytestmark = pytest.mark.asyncio
+_, WIFI_INTERVAL, WIFI_CAP = ENDPOINTS["wifi"]
 
 
 @pytest.fixture
@@ -24,32 +26,44 @@ def coordinator(hass, marstek_entry, mock_marstek_api, wifi_clock):
     return MarstekDataUpdateCoordinator(hass, mock_marstek_api, marstek_entry)
 
 
+def polls_at(times, interval):
+    """Reads a completion-deadline endpoint makes at these (instant) poll times."""
+    count, last = 0, None
+    for now in times:
+        if last is None or now >= last + interval:
+            count, last = count + 1, now
+    return count
+
+
 @pytest.mark.parametrize("response", [{"rssi": -45}, {}])
-async def test_wifi_waits_five_minutes_while_other_endpoints_keep_polling(
+async def test_wifi_waits_its_interval_while_other_endpoints_keep_polling(
     coordinator, mock_marstek_api, wifi_clock, response
 ):
     """Initial reads are immediate; cached diagnostics do not add UDP requests."""
     mock_marstek_api.get_wifi_status.return_value = response
     assert (await coordinator._async_update_data())["wifi"] == response
     mock_marstek_api.get_wifi_status.return_value = {"rssi": -65}
-    for seconds in (30, 60, 120, 180, 240, 299.999):
+    times = [0, 30, 60, 120, 180, 240, 300, 600, WIFI_INTERVAL - 0.001]
+    for seconds in times[1:]:
         wifi_clock.return_value = 1000 + seconds
         assert (await coordinator._async_update_data())["wifi"] == response
         assert mock_marstek_api.get_wifi_status.call_count == 1
         assert coordinator._missing_cycles["wifi"] == 0
 
-    wifi_clock.return_value = 1300.0
+    times.append(WIFI_INTERVAL)
+    wifi_clock.return_value = 1000 + WIFI_INTERVAL
     assert (await coordinator._async_update_data())["wifi"] == {"rssi": -65}
     assert mock_marstek_api.get_wifi_status.call_count == 2
-    for method in (
-        "get_ble_status",
-        "get_battery_status",
-        "get_pv_status",
-        "get_es_status",
-        "get_es_mode",
-        "get_em_status",
+    for key, method in (
+        ("ble", "get_ble_status"),
+        ("battery", "get_battery_status"),
+        ("pv", "get_pv_status"),
+        ("es", "get_es_status"),
+        ("es_mode", "get_es_mode"),
+        ("em", "get_em_status"),
     ):
-        expected = 7 if method in {"get_ble_status", "get_es_status"} else 6
+        expected = polls_at(times, ENDPOINTS[key][1])
+        assert expected > 1
         assert getattr(mock_marstek_api, method).call_count == expected
 
 
@@ -57,20 +71,26 @@ async def test_initial_wifi_failures_back_off_until_success(
     coordinator, mock_marstek_api, wifi_clock
 ):
     mock_marstek_api.get_wifi_status.side_effect = [None, None, {"rssi": -60}]
-    for seconds in (0, 600):
+    wifi = coordinator._polling.sections["wifi"]
+    for seconds in (0, WIFI_CAP):
         wifi_clock.return_value = 1000 + seconds
         assert "wifi" not in await coordinator._async_update_data()
-    wifi_clock.return_value = 2500.0
+        assert wifi.next_poll == 1000 + seconds + WIFI_CAP
+    wifi_clock.return_value = wifi.next_poll - 0.001
+    assert "wifi" not in await coordinator._async_update_data()
+    assert mock_marstek_api.get_wifi_status.call_count == 2
+    success = wifi.next_poll
+    wifi_clock.return_value = success
     assert (await coordinator._async_update_data())["wifi"] == {"rssi": -60}
     assert mock_marstek_api.get_wifi_status.call_count == 3
     assert "wifi" not in coordinator._disabled_optional_sections
 
     mock_marstek_api.get_wifi_status.side_effect = None
     mock_marstek_api.get_wifi_status.return_value = {"rssi": -50}
-    wifi_clock.return_value = 2799.999
+    wifi_clock.return_value = success + WIFI_INTERVAL - 0.001
     assert (await coordinator._async_update_data())["wifi"] == {"rssi": -60}
     assert mock_marstek_api.get_wifi_status.call_count == 3
-    wifi_clock.return_value = 2800.0
+    wifi_clock.return_value = success + WIFI_INTERVAL
     assert (await coordinator._async_update_data())["wifi"] == {"rssi": -50}
     assert mock_marstek_api.get_wifi_status.call_count == 4
 
@@ -84,10 +104,10 @@ async def test_wifi_interval_starts_after_successful_response(
 
     mock_marstek_api.get_wifi_status.side_effect = receive
     await coordinator._async_update_data()
-    wifi_clock.return_value = 1300.0
+    wifi_clock.return_value = 1000.0 + WIFI_INTERVAL
     await coordinator._async_update_data()
     assert mock_marstek_api.get_wifi_status.call_count == 1
-    wifi_clock.return_value = 1305.0
+    wifi_clock.return_value = 1005.0 + WIFI_INTERVAL
     await coordinator._async_update_data()
     assert mock_marstek_api.get_wifi_status.call_count == 2
 

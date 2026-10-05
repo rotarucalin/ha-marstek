@@ -36,6 +36,7 @@ from custom_components.marstek.const import (
     MODE_PASSIVE,
 )
 from custom_components.marstek.marstek_api import MarstekAPI
+from custom_components.marstek.polling import ENDPOINTS
 
 # Every model in the capability table, with the facts chapter 3.5, chapter 4
 # and the manual_cfg table of the Open API (Rev 3.1) state about it.
@@ -262,7 +263,8 @@ async def test_pv_models_are_polled_for_pv(
     mock_marstek_api.get_pv_status.return_value = {"pv1_power": 120}
     for cycle in range(3):
         monkeypatch.setattr(
-            "custom_components.marstek.monotonic", lambda cycle=cycle: 1000 + cycle * 60
+            "custom_components.marstek.monotonic",
+            lambda cycle=cycle: 1000 + cycle * ENDPOINTS["pv"][1],
         )
         data = await coordinator._async_update_data()
         assert data["pv"] == {"pv1_power": 120}

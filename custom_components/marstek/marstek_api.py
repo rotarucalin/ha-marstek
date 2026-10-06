@@ -149,6 +149,14 @@ class MarstekAPI:
                         continue
                     break
 
+            _LOGGER.debug(
+                "Marstek RX: host=%s method=%s request_id=%s response=%s",
+                self.host,
+                method,
+                request["id"],
+                response,
+            )
+
             if "error" in response:
                 self._log_request_error(
                     method,

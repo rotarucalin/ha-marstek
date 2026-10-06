@@ -268,7 +268,7 @@ class MarstekAPI:
             },
         }
         result = self._send_request("ES.SetMode", params)
-        return result is not None and result.get("set_result", False)
+        return isinstance(result, dict) and result.get("set_result") is True
 
     def set_es_mode_ai(self) -> bool:
         """Set energy system to AI mode."""
@@ -280,7 +280,7 @@ class MarstekAPI:
             },
         }
         result = self._send_request("ES.SetMode", params)
-        return result is not None and result.get("set_result", False)
+        return isinstance(result, dict) and result.get("set_result") is True
 
     def set_es_mode_manual(
         self,
@@ -316,7 +316,7 @@ class MarstekAPI:
             },
         }
         result = self._send_request("ES.SetMode", params)
-        return result is not None and result.get("set_result", False)
+        return isinstance(result, dict) and result.get("set_result") is True
 
     def set_es_mode_passive(self, power: int, cd_time: int = 3600) -> bool:
         """Set energy system to Passive mode."""
@@ -331,4 +331,4 @@ class MarstekAPI:
             },
         }
         result = self._send_request("ES.SetMode", params)
-        return result is not None and result.get("set_result", False)
+        return isinstance(result, dict) and result.get("set_result") is True

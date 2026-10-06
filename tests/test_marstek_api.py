@@ -180,10 +180,20 @@ def test_hostname_resolution_failure(caplog):
     ("response", "success"),
     [
         ({"result": {"set_result": True}}, True),
-        ({"result": {"set_result": 1}}, True),
+        ({"src": "venus", "result": {"id": 0, "set_result": True}}, True),
+        ({"src": None, "extra": 42, "result": {"set_result": True}}, True),
+        ({"result": {"set_result": 1}}, False),
+        ({"result": {"set_result": 1.0}}, False),
+        ({"result": {"set_result": "true"}}, False),
+        ({"result": {"set_result": None}}, False),
         ({"result": {"set_result": False}}, False),
         ({"result": {}}, False),
         ({"result": None}, False),
+        ({"result": []}, False),
+        ({"result": [{"set_result": True}]}, False),
+        ({"result": "success"}, False),
+        ({"result": True}, False),
+        ({"result": 1}, False),
         ({}, False),
         ({"error": {"code": -1, "message": "rejected"}}, False),
     ],
@@ -197,7 +207,7 @@ def test_mode_success_requires_set_result(mode, args, config, response, success)
             json.dumps({"id": 1, **response}).encode(),
             ("192.0.2.1", 30000),
         )
-        assert bool(getattr(api, f"set_es_mode_{mode}")(*args)) is success
+        assert getattr(api, f"set_es_mode_{mode}")(*args) is success
         payload, address = connection.sendto.call_args.args
         assert address == ("192.0.2.1", 30000)
         assert json.loads(payload) == {
@@ -219,7 +229,11 @@ def test_mode_success_requires_set_result(mode, args, config, response, success)
             "API error: -1 - rejected",
         ),
         (b'{"id":1,"result":{"set_result":false}}', None),
+        (b'{"id":1,"result":{"set_result":1}}', None),
         (b'{"id":1,"result":{}}', None),
+        (b'{"id":1,"result":[]}', None),
+        (b'{"id":1,"result":null}', None),
+        (b'{"id":1}', None),
     ],
 )
 async def test_real_api_failure_schedules_retry_with_one_warning(
@@ -352,11 +366,21 @@ def test_invalid_packets_do_not_reset_timeout(caplog, packets_keep_arriving):
     assert all(record.levelno == logging.DEBUG for record in ignored)
 
 
+@pytest.mark.parametrize(
+    "packet",
+    [
+        b'{"id":0,"result":{"set_result":false}}',
+        b'{"id":0,"result":{"id":1,"set_result":true}}',
+        b'{"id":2,"result":{"set_result":true}}',
+        b'{"id":0,"error":{"code":-32700,"message":"Parse error","data":403}}',
+    ],
+)
+@pytest.mark.parametrize("matching_ack", [False, True])
 @pytest.mark.asyncio
-async def test_invalid_packet_then_valid_ack_does_not_schedule_retry(
-    hass, marstek_entry, caplog
+async def test_mode_command_ignores_mismatching_responses(
+    hass, marstek_entry, caplog, packet, matching_ack
 ):
-    """A stale acknowledgement must not trigger the coordinator's failure retry."""
+    """Only a matching acknowledgement succeeds; unrelated packets are ignored."""
     marstek_entry.add_to_hass(hass)
     coordinator = MarstekDataUpdateCoordinator(
         hass, MarstekAPI("192.0.2.1"), marstek_entry
@@ -367,13 +391,20 @@ async def test_invalid_packet_then_valid_ack_does_not_schedule_retry(
     ):
         connection = socket.return_value.__enter__.return_value
         connection.recvfrom.side_effect = [
-            (b'{"id":0,"result":{"set_result":false}}', ("192.0.2.1", 30000)),
-            (b'{"id":1,"result":{"set_result":true}}', ("192.0.2.1", 30000)),
+            (packet, ("192.0.2.1", 30000)),
+            (
+                b'{"id":1,"result":{"id":0,"set_result":true}}',
+                ("192.0.2.1", 30000),
+            )
+            if matching_ack
+            else TimeoutError(),
         ]
-        assert await coordinator.async_set_passive_power(240)
-        assert later.call_args.args[1] == 180
+        assert await coordinator.async_set_passive_power(240) is matching_ack
+        assert later.call_args.args[1] == (180 if matching_ack else 15)
+        assert connection.recvfrom.call_count == 2
         connection.sendto.assert_called_once()
-        assert not [
+        warnings = [
             record for record in caplog.records if record.levelno >= logging.WARNING
         ]
+        assert len(warnings) == (0 if matching_ack else 1)
         await coordinator.async_stop_passive_control()

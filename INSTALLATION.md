@@ -89,7 +89,7 @@ Choose one of the following installation methods:
    - Open Home Assistant
    - Go to HACS → Integrations
    - Click three dots (⋮) → Custom repositories
-   - Add repository URL: `https://github.com/yourusername/ha-marstek`
+   - Add repository URL: `https://github.com/rotarucalin/ha-marstek`
    - Category: Integration
    - Click ADD
 
@@ -107,7 +107,7 @@ Choose one of the following installation methods:
 
 1. **Download the Integration**
    - Download the latest release from GitHub
-   - Or clone the repository: `git clone https://github.com/yourusername/ha-marstek.git`
+   - Or clone the repository: `git clone https://github.com/rotarucalin/ha-marstek.git`
 
 2. **Copy Files**
    ```bash
@@ -305,7 +305,7 @@ If you encounter issues:
    - Check troubleshooting sections
 
 2. **Search Existing Issues**
-   - GitHub: https://github.com/yourusername/ha-marstek/issues
+   - GitHub: https://github.com/rotarucalin/ha-marstek/issues
 
 3. **Community Support**
    - Home Assistant Community Forums

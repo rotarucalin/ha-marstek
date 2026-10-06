@@ -328,6 +328,6 @@ For detailed instructions, see INSTALLATION.md and README.md.
 
 ---
 
-**Package Version:** 1.0.0  
+**Package Version:** 2.6.0.1\
 **API Version:** Rev 1.0  
 **Last Updated:** December 2025

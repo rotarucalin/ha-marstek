@@ -722,7 +722,10 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 else:
                     next_action = f"retry in {PASSIVE_POWER_RETRY_SECONDS}s"
             else:
-                next_action = "passive control stopped; no automatic retry"
+                next_action = (
+                    "existing Passive control preserved; "
+                    "requested mode change was not applied"
+                )
             _LOGGER.warning(
                 "Marstek command failed: %s error=%s; %s", context, error, next_action
             )

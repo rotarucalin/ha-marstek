@@ -362,6 +362,13 @@ async def test_select_failure_raises_and_keeps_passive_control(
     command.assert_called_once_with()
     assert f"source=operating_mode_select method=ES.SetMode mode={mode}" in caplog.text
     assert command_timers.active == [keepalive]
+    failures = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(failures) == 1
+    assert (
+        "existing Passive control preserved; requested mode change was not applied"
+        in failures[0].message
+    )
+    assert "passive control stopped" not in caplog.text
     assert coordinator._passive_desired_power == 240
     assert coordinator._passive_command_power == 240
 
@@ -489,7 +496,7 @@ async def test_manual_success_clears_active_passive_control(
 
 
 async def test_manual_failure_leaves_active_passive_control_untouched(
-    coordinator, command_timers, mock_marstek_api
+    coordinator, command_timers, mock_marstek_api, caplog
 ):
     """A device-rejected Manual command must not stop the Passive countdown."""
     await coordinator.async_set_passive_power(240)
@@ -507,6 +514,17 @@ async def test_manual_failure_leaves_active_passive_control_untouched(
             enable=1,
         )
         clear_mock.assert_not_called()
+
+    failures = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(failures) == 1
+    assert (
+        "existing Passive control preserved; requested mode change was not applied"
+        in failures[0].message
+    )
+    assert "passive control stopped" not in caplog.text
+    assert (
+        "source=set_operating_mode_manual method=ES.SetMode mode=Manual" in caplog.text
+    )
 
     # The same timer, not a cancelled-and-rescheduled replacement, is still due.
     assert command_timers.active == [keepalive]

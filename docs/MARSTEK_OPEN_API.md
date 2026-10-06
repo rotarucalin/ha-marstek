@@ -134,7 +134,8 @@ which was 10× too low. That correction broke long-term statistics; see
 config object: `auto_cfg`, `ai_cfg`, `manual_cfg`, `passive_cfg`, `ups_cfg`.
 
 The response is `{"id": ..., "set_result": true}`. A transport-level success is
-not an acknowledgement; `set_result` must be present and true. The PDF's
+not an acknowledgement; `set_result` must be present and its value must be
+the literal JSON boolean `true` (`result.get("set_result") is True`). The PDF's
 examples misspell this value as `ture`, which is a typo in the document, not a
 wire format.
 

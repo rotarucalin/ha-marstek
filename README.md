@@ -73,7 +73,7 @@ each model exposes and where the official document contradicts itself.
 2. Click on "Integrations"
 3. Click the three dots in the top right corner
 4. Select "Custom repositories"
-5. Add this repository URL: `https://github.com/leonscheltema/ha-marstek`
+5. Add this repository URL: `https://github.com/rotarucalin/ha-marstek`
 6. Select category: "Integration"
 7. Click "Add"
 8. Search for "Marstek Battery System" in HACS
@@ -219,7 +219,7 @@ Enable `custom_components.marstek: debug` in Home Assistant's logger configurati
 - `operating_mode_select`: an explicit Auto or AI selection. Selecting Manual here always fails (see [Manual Mode](#manual-mode)); nothing is logged as a command since none is sent.
 - `set_operating_mode_manual`: a Manual schedule slot written through the service.
 
-Routine successful keepalives and timer scheduling are silent. A failed command produces one WARNING with the next action; underlying transport/protocol errors add DEBUG details. Retry attempts and their results remain visible at DEBUG. A command is logged as successful only when the API returns a truthy `set_result`. Confirmation of reported mode/power remains a separate polling step; a verification mismatch logs the desired and commanded power alongside the reported mode and power before retrying.
+Routine successful keepalives and timer scheduling are silent. A failed command produces one WARNING with the next action; underlying transport/protocol errors add DEBUG details. Retry attempts and their results remain visible at DEBUG. An `ES.SetMode` command is logged as successful only when `set_result` is present in the API response result and its value is the literal JSON boolean `true` (`result.get("set_result") is True`). Transport success alone does not mean the command was acknowledged. Confirmation of reported mode/power remains a separate polling step; a verification mismatch logs the desired and commanded power alongside the reported mode and power before retrying.
 
 While a Passive target is maintained, a separate DEBUG line traces the three power values and where the command came from:
 
@@ -518,7 +518,7 @@ For detailed API documentation, refer to the Marstek Device Open API documentati
 ## Support
 
 For issues, feature requests, or questions:
-- Open an issue on [GitHub](https://github.com/leonscheltema/ha-marstek/issues)
+- Open an issue on [GitHub](https://github.com/rotarucalin/ha-marstek/issues)
 - Check existing issues for solutions
 - Review the Marstek API documentation
 

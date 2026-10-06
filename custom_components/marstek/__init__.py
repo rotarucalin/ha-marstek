@@ -205,7 +205,6 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._io_gate = CommandPriorityGate()
         self._fresh_sections: set[str] = set()
         self._mode_verification_required = False
-        self._es_telemetry_stale = False
         # Stop probing failed Bluetooth or an explicitly disconnected CT.
         # Probe again when a fresh coordinator is created on startup/reload.
         self._disabled_optional_sections: set[str] = set()
@@ -392,7 +391,8 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         if state == self._passive_power_state:
             return
         self._passive_power_state = state
-        if state != PASSIVE_STATE_ACKNOWLEDGED:
+        # Unknown output can result from a read failure, not a control event.
+        if state in (PASSIVE_STATE_SENT, PASSIVE_STATE_RETRYING):
             self._require_mode_verification()
         # A poll publishes its data and verification state together. In particular,
         # recovery must not notify listeners with the pre-command zero reading.
@@ -1449,7 +1449,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             raise
 
     def _require_mode_verification(self) -> None:
-        """Every ES.SetMode, non-acknowledged state and retry passes through here."""
+        """Request faster verification only for a command or observed mismatch."""
         self._mode_verification_required = True
         self._polling.require_mode(monotonic())
         self._polling.request_active(monotonic())
@@ -1459,19 +1459,6 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         if self._mode_verification_required:
             return False
         return self._passive_desired_power is None or self._passive_is_stable()
-
-    def _check_es_freshness(self) -> None:
-        """An ES outage requests verification once, not on every skipped poll."""
-        state = self._polling.sections["es"]
-        stale = (
-            state.last_success is None
-            or state.consecutive_failures > 0
-            or monotonic() - state.last_success > ES_FRESH_SECONDS
-            or numeric(self._last_good_data.get("es", {}).get("ongrid_power")) is None
-        )
-        if stale and not self._es_telemetry_stale:
-            self._require_mode_verification()
-        self._es_telemetry_stale = stale
 
     def _passive_is_stable(self) -> bool:
         state = self._polling.sections["es"]
@@ -1556,13 +1543,9 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 self._mode_verification_required = False
             self._missing_cycles[key] = 0
             self._last_good_data[key] = result
-            if key == "es" and self._passive_desired_power is not None:
-                self._check_es_freshness()
             return result
 
         self._missing_cycles[key] = self._missing_cycles.get(key, 0) + 1
-        if key == "es" and self._passive_desired_power is not None:
-            self._check_es_freshness()
         if key in OPTIONAL_SECTIONS:
             self._disabled_optional_sections.add(key)
             self._last_good_data.pop(key, None)
@@ -1594,9 +1577,6 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._fresh_sections.clear()
         try:
             data = {}
-
-            if self._passive_desired_power is not None:
-                self._check_es_freshness()
 
             await self._async_refresh_device_info()
             data["device_info"] = dict(self.device_info)

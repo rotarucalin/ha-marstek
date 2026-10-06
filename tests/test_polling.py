@@ -79,6 +79,7 @@ async def test_failures_back_off_only_failed_endpoint_and_reset(
         await coordinator._fetch_section(key, fetch)
         assert fetch.call_count == failure
         assert not coordinator._polling.degraded
+        assert coordinator._polling.profile == PROFILE_NORMAL
         assert all(
             s.consecutive_failures == 0
             for k, s in coordinator._polling.sections.items()
@@ -219,7 +220,7 @@ async def test_cancelled_waiting_command_does_not_starve_reads():
         assert gate.pending_commands == 0
 
 
-async def test_healthy_passive_uses_normal_mode_cadence_and_unknown_verification(
+async def test_unknown_output_waits_for_normal_passive_polling(
     coordinator, mock_marstek_api, clock
 ):
     mock_marstek_api.get_es_status.return_value = {"ongrid_power": 250}
@@ -239,8 +240,14 @@ async def test_healthy_passive_uses_normal_mode_cadence_and_unknown_verification
     clock.now += 30
     coordinator._set_passive_power_state("unknown")
     await coordinator.async_refresh()
-    assert mock_marstek_api.get_es_mode.call_count == 3
+    assert mock_marstek_api.get_es_mode.call_count == 2
+    assert coordinator.passive_power_state == "unknown"
+    assert coordinator._polling.profile == PROFILE_NORMAL
+    clock.now += 30
+    await coordinator.async_refresh()
     assert coordinator.passive_power_state == "acknowledged"
+    assert mock_marstek_api.get_es_mode.call_count == 2
+    assert coordinator._polling.profile == PROFILE_NORMAL
 
 
 async def test_status_acknowledges_new_command_despite_mode_failure(
@@ -358,18 +365,16 @@ async def test_failed_reads_during_degradation_do_not_trigger_recovery_traffic(
     assert coordinator.passive_power_state == "unknown"
     assert coordinator._passive_retry is None
     mock_marstek_api.set_es_mode_passive.assert_not_called()
-    # ES probes obey both health and endpoint backoff. Mode verification is
-    # requested on the state/freshness transition, not repeatedly while stale.
+    # ES probes obey both health and endpoint backoff; failed/stale status
+    # never requests extra mode verification through the health circuit breaker.
     assert mock_marstek_api.get_es_status.call_count == 2
-    assert mock_marstek_api.get_es_mode.call_count <= 2
+    mock_marstek_api.get_es_mode.assert_not_called()
     for key in ("wifi", "battery", "pv"):
         getattr(mock_marstek_api, METHODS[key]).assert_not_called()
         assert key in coordinator.data
 
 
-@pytest.mark.parametrize(
-    "reason", ["stale", "failed_status", "failed_mode", "failed_command", "recovery"]
-)
+@pytest.mark.parametrize("reason", ["failed_command", "recovery"])
 async def test_stable_passive_leaves_normal_mode_polling_when_verification_needed(
     coordinator, mock_marstek_api, clock, reason
 ):
@@ -382,25 +387,13 @@ async def test_stable_passive_leaves_normal_mode_polling_when_verification_neede
     assert coordinator._polling.profile == PROFILE_NORMAL
     assert coordinator._polling.effective_interval("es_mode") == ENDPOINTS["es_mode"][1]
     assert mock_marstek_api.get_es_mode.call_count == 1
-    if reason == "stale":
-        clock.now += ES_FRESH_SECONDS + 1
-    elif reason == "failed_status":
-        clock.now = coordinator._polling.sections["es"].next_poll
-        mock_marstek_api.get_es_status.return_value = None
-    elif reason == "failed_mode":
-        clock.now = coordinator._polling.sections["es_mode"].next_poll
-        mock_marstek_api.get_es_mode.return_value = None
-    elif reason == "failed_command":
+    if reason == "failed_command":
         mock_marstek_api.set_es_mode_passive.return_value = False
         await coordinator.async_set_passive_power(260)
     else:
         coordinator._schedule_passive_retry("verification_retry")
     await coordinator.async_refresh()
     assert mock_marstek_api.get_es_mode.call_count == 2
-    if reason == "failed_status":
-        assert coordinator.passive_power_state == "unknown"
-    elif reason == "failed_mode":
-        assert coordinator.passive_power_state == "acknowledged"
 
 
 async def test_degraded_new_command_can_be_verified_without_nonessential_reads(
@@ -508,6 +501,7 @@ async def test_mode_failure_backoff_preserves_power_acknowledgement(
     mock_marstek_api.get_es_mode.return_value = None
     await coordinator.async_refresh()
     assert coordinator.passive_power_state == "acknowledged"
+    assert coordinator._polling.profile == PROFILE_NORMAL
     failed_calls = mock_marstek_api.get_es_mode.call_count
     deadline = mode.next_poll
     assert deadline > clock.now + mode.interval
@@ -517,6 +511,7 @@ async def test_mode_failure_backoff_preserves_power_acknowledgement(
         assert coordinator.passive_power_state == "acknowledged"
         assert mock_marstek_api.get_es_mode.call_count == failed_calls
         assert mode.next_poll == deadline
+        assert coordinator._polling.profile == PROFILE_NORMAL
     clock.now = deadline
     mock_marstek_api.get_es_mode.side_effect = None
     mock_marstek_api.get_es_mode.return_value = {"mode": "Passive", "ongrid_power": 250}
@@ -604,6 +599,8 @@ async def test_set_mode_activates_fast_profile(
     assert coordinator._polling.profile == PROFILE_NORMAL
     mock_marstek_api.set_es_mode_auto.return_value = accepted
     assert await coordinator.async_set_operating_mode("Auto") is accepted
+    await coordinator._fetch_section("battery", mock_marstek_api.get_battery_status)
+    assert coordinator._polling.profile == PROFILE_ACTIVE
     mock_marstek_api.reset_mock()
     clock.now += ACTIVE_INTERVALS["es"]
     await coordinator.async_refresh()
@@ -665,6 +662,8 @@ async def test_passive_confirmation_returns_to_normal_polling(
     clock.now = 1010
     await coordinator.async_set_passive_power(250)
     assert coordinator.passive_power_state == "sent"
+    await coordinator._fetch_section("battery", mock_marstek_api.get_battery_status)
+    assert coordinator._polling.profile == PROFILE_ACTIVE
     mock_marstek_api.reset_mock()
     clock.now = 1030
     await coordinator.async_refresh()
@@ -746,3 +745,85 @@ async def test_active_profile_keeps_disabled_optional_sections_off(
     assert mock_marstek_api.get_ble_status.call_count == 1
     assert mock_marstek_api.get_em_status.call_count == 1
     assert coordinator.data["em"] == {"ct_state": 0}
+
+
+@pytest.mark.parametrize("passive", [False, True])
+@pytest.mark.parametrize("error", [None, TimeoutError, RuntimeError])
+async def test_es_read_failure_does_not_activate_or_accelerate_other_endpoints(
+    coordinator, mock_marstek_api, clock, caplog, passive, error
+):
+    mock_marstek_api.get_es_status.return_value = {"ongrid_power": 250}
+    mock_marstek_api.get_es_mode.return_value = {"mode": "Passive", "ongrid_power": 250}
+    if passive:
+        await coordinator.async_set_passive_power(250)
+    await coordinator.async_refresh()
+    assert coordinator._polling.profile == PROFILE_NORMAL
+    deadlines = {
+        key: state.next_poll for key, state in coordinator._polling.sections.items()
+    }
+    mock_marstek_api.reset_mock()
+    caplog.clear()
+    caplog.set_level("DEBUG")
+    mock_marstek_api.get_es_status.return_value = None
+    mock_marstek_api.get_es_status.side_effect = error
+    for now in (1060, 1090):
+        clock.now = now
+        await coordinator.async_refresh()
+        assert coordinator._polling.profile == PROFILE_NORMAL
+        assert not coordinator._mode_verification_required
+        assert {
+            key: state.next_poll
+            for key, state in coordinator._polling.sections.items()
+            if key != "es"
+        } == {key: deadline for key, deadline in deadlines.items() if key != "es"}
+    assert calls(mock_marstek_api) == {key: int(key == "es") for key in METHODS}
+    assert coordinator._polling.sections["es"].next_poll == 1180
+    if passive:
+        assert coordinator.passive_power_state == "unknown"
+    # A stale cached output during backoff must not restart control polling.
+    clock.now = 1000 + ES_FRESH_SECONDS + 1
+    await coordinator.async_refresh()
+    assert coordinator._polling.profile == PROFILE_NORMAL
+    assert "profile=active" not in caplog.text
+    assert coordinator._passive_retry is None
+    mock_marstek_api.set_es_mode_passive.assert_not_called()
+    mock_marstek_api.set_es_mode_auto.assert_not_called()
+    mock_marstek_api.get_battery_status.assert_not_called()
+    assert mock_marstek_api.get_es_mode.call_count == 1  # Normal 120 s deadline.
+
+
+async def test_multiple_read_failures_degrade_without_activating_control_polling(
+    coordinator, mock_marstek_api, clock, caplog
+):
+    mock_marstek_api.get_es_status.return_value = {"ongrid_power": 250}
+    mock_marstek_api.get_es_mode.return_value = {"mode": "Passive", "ongrid_power": 250}
+    await coordinator.async_set_passive_power(250)
+    await coordinator.async_refresh()
+    assert coordinator._polling.profile == PROFILE_NORMAL
+    mock_marstek_api.reset_mock()
+    caplog.clear()
+    caplog.set_level("DEBUG")
+    for key in CONTROL_ENDPOINTS:
+        getattr(mock_marstek_api, METHODS[key]).side_effect = TimeoutError
+    clock.now = 1180
+    await coordinator.async_refresh()
+    policy = coordinator._polling
+    assert policy.degraded
+    for key in CONTROL_ENDPOINTS:
+        state = policy.sections[key]
+        assert state.consecutive_failures == 1
+        assert state.next_poll == 1180 + min(state.cap, state.interval * 2)
+    for now in (1210, 1240, 1270, 1300, 1330, 1360, 1390, 1420, 1450):
+        clock.now = now
+        await coordinator.async_refresh()
+        assert policy.profile == PROFILE_NORMAL
+        assert policy.degraded
+        assert not coordinator._mode_verification_required
+    assert calls(mock_marstek_api) == {
+        key: 2 if key == "es" else int(key in CONTROL_ENDPOINTS) for key in METHODS
+    }
+    assert policy.sections["es"].next_poll == 1480  # Second failure reaches cap.
+    assert coordinator._passive_retry is None
+    assert "profile=active" not in caplog.text
+    mock_marstek_api.set_es_mode_passive.assert_not_called()
+    mock_marstek_api.set_es_mode_auto.assert_not_called()

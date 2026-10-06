@@ -11,6 +11,11 @@ from custom_components.marstek import MarstekDataUpdateCoordinator
 from custom_components.marstek.marstek_api import MarstekAPI
 
 API_MODULE = "custom_components.marstek.marstek_api"
+DISCOVERY_DEVICE = {
+    "device": "Venus A",
+    "ble_mac": "AA:BB:CC:DD:EE:01",
+    "ip": "192.0.2.1",
+}
 
 
 @pytest.mark.parametrize("log_level", [logging.DEBUG, logging.INFO])
@@ -92,13 +97,17 @@ def test_tx_logs_wire_payload_before_send(
     ):
         connection = socket_factory.return_value.__enter__.return_value
         connection.sendto.side_effect = send
+        reply = DISCOVERY_DEVICE if discovery else {"set_result": True}
         connection.recvfrom.side_effect = [
-            (b'{"id":123,"result":{"set_result":true}}', ("192.0.2.1", api.port)),
+            (
+                json.dumps({"id": 123, "result": reply}).encode(),
+                ("192.0.2.1", api.port),
+            ),
             TimeoutError(),
         ]
         result = getattr(api, api_method)(*args)
         if discovery:
-            assert result == [{"set_result": True, "ip": "192.0.2.1"}]
+            assert result == [DISCOVERY_DEVICE]
         elif method == "ES.SetMode":
             assert result is True
         else:
@@ -408,3 +417,289 @@ async def test_mode_command_ignores_mismatching_responses(
         ]
         assert len(warnings) == (0 if matching_ack else 1)
         await coordinator.async_stop_passive_control()
+
+
+def discovery_packet(result=None, request_id=1):
+    """Encode a discovery reply with an outer request ID."""
+    return json.dumps(
+        {
+            "id": request_id,
+            "result": DISCOVERY_DEVICE if result is None else result,
+        }
+    ).encode()
+
+
+@pytest.mark.parametrize("request_id", [0, 1, 123])
+@pytest.mark.parametrize(
+    "optional_fields",
+    [
+        {},
+        {
+            "id": 0,
+            "ver": 123,
+            "wifi_mac": "AA:BB:CC:DD:EE:02",
+            "wifi_name": "LAN",
+        },
+    ],
+)
+def test_discovery_accepts_valid_reply(request_id, optional_fields):
+    """Discovery echoes the caller's outer ID; firmware metadata is optional."""
+    api = MarstekAPI("255.255.255.255")
+    api._request_id = request_id - 1
+    device = {**DISCOVERY_DEVICE, **optional_fields}
+    with patch(f"{API_MODULE}.socket.socket") as socket_factory:
+        connection = socket_factory.return_value.__enter__.return_value
+        connection.recvfrom.side_effect = [
+            (discovery_packet(device, request_id), (device["ip"], 30001)),
+            TimeoutError(),
+        ]
+        assert api.discover_devices() == [device]
+        connection.setsockopt.assert_called_once_with(
+            socket.SOL_SOCKET, socket.SO_BROADCAST, 1
+        )
+        payload, destination = connection.sendto.call_args.args
+        assert json.loads(payload) == {
+            "id": request_id,
+            "method": "Marstek.GetDevice",
+            "params": {"ble_mac": "0"},
+        }
+        assert destination == ("255.255.255.255", 30000)
+        assert connection.recvfrom.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "duplicate_mac",
+    [
+        "AA:BB:CC:DD:EE:01",
+        "aa:bb:cc:dd:ee:01",
+        "aabbccddee01",
+        "AA-BB-CC-DD-EE-01",
+    ],
+)
+def test_discovery_multiple_devices_and_duplicates(duplicate_mac, caplog):
+    """Identity deduplication works across spelling variants and source IPs."""
+    api = MarstekAPI("255.255.255.255")
+    second = {**DISCOVERY_DEVICE, "ble_mac": "AA:BB:CC:DD:EE:02", "ip": "192.0.2.2"}
+    duplicate = {**DISCOVERY_DEVICE, "ble_mac": duplicate_mac, "ip": "192.0.2.3"}
+    caplog.set_level(logging.DEBUG, logger=API_MODULE)
+    with patch(f"{API_MODULE}.socket.socket") as socket_factory:
+        connection = socket_factory.return_value.__enter__.return_value
+        connection.recvfrom.side_effect = [
+            (discovery_packet(), ("192.0.2.1", 30000)),
+            (discovery_packet(), ("192.0.2.1", 30000)),
+            (discovery_packet(duplicate), ("192.0.2.3", 30000)),
+            (discovery_packet(second), ("192.0.2.2", 30000)),
+            TimeoutError(),
+        ]
+        assert api.discover_devices() == [DISCOVERY_DEVICE, second]
+        assert connection.recvfrom.call_count == 5
+        connection.sendto.assert_called_once()
+    assert "duplicate device" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("packet", "diagnostic"),
+    [
+        (b"invalid json", "invalid JSON"),
+        (b"\xff", "invalid JSON"),
+        pytest.param(b"[" * 1100, "invalid JSON", id="deeply-nested-json"),
+        pytest.param(
+            b'{"id":' + b"1" * 4500 + b"}", "invalid JSON", id="oversized-integer"
+        ),
+        (b"[]", "non-object response"),
+        (b'"unrelated"', "non-object response"),
+        (b"123", "non-object response"),
+        (b"null", "non-object response"),
+        (b"true", "non-object response"),
+        (json.dumps({"result": DISCOVERY_DEVICE}).encode(), "missing request ID"),
+        (discovery_packet(request_id=99), "mismatching request ID"),
+        (discovery_packet(request_id="0"), "invalid request ID type"),
+        (discovery_packet(request_id="1"), "invalid request ID type"),
+        (discovery_packet(request_id=True), "invalid request ID type"),
+        (discovery_packet(request_id=1.0), "invalid request ID type"),
+        (discovery_packet(request_id=None), "invalid request ID type"),
+        (discovery_packet(request_id=[]), "invalid request ID type"),
+        (discovery_packet(request_id={}), "invalid request ID type"),
+        (b'{"id":1}', "missing/invalid result"),
+        (b'{"id":1,"result":null}', "missing/invalid result"),
+        (b'{"id":1,"result":[]}', "missing/invalid result"),
+        (b'{"id":1,"result":"device"}', "missing/invalid result"),
+        (b'{"id":1,"result":42}', "missing/invalid result"),
+        (b'{"id":1,"result":true}', "missing/invalid result"),
+        (
+            b'{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"rejected"}}',
+            "API error response: -1 - rejected",
+        ),
+        (b'{"id":99,"error":{"code":-1,"message":"stale"}}', "mismatching request ID"),
+        (b'{"id":1,"error":null}', "invalid API error response"),
+        (b'{"id":1,"error":[]}', "invalid API error response"),
+        (b'{"id":1,"error":{}}', "invalid API error response"),
+        (
+            json.dumps(
+                {
+                    "id": 1,
+                    "error": {"code": -1, "message": "rejected"},
+                    "result": DISCOVERY_DEVICE,
+                }
+            ).encode(),
+            "API error response",
+        ),
+        (b'{"method":"unrelated","params":{"id":0}}', "missing request ID"),
+        (b'{"id":1,"result":{"set_result":true}}', "required device fields"),
+    ],
+)
+def test_discovery_ignores_bad_packet_and_keeps_devices(caplog, packet, diagnostic):
+    """One malformed, unrelated or error reply cannot abort broadcast discovery."""
+    api = MarstekAPI("255.255.255.255")
+    second = {**DISCOVERY_DEVICE, "ble_mac": "AA:BB:CC:DD:EE:02", "ip": "192.0.2.2"}
+    caplog.set_level(logging.DEBUG, logger=API_MODULE)
+    with patch(f"{API_MODULE}.socket.socket") as socket_factory:
+        connection = socket_factory.return_value.__enter__.return_value
+        connection.recvfrom.side_effect = [
+            (discovery_packet(), ("192.0.2.1", 30000)),
+            (packet, ("192.0.2.99", 45678)),
+            (discovery_packet(second), ("192.0.2.2", 30000)),
+            TimeoutError(),
+        ]
+        assert api.discover_devices() == [DISCOVERY_DEVICE, second]
+        assert connection.recvfrom.call_count == 4
+        connection.sendto.assert_called_once()
+    assert diagnostic in caplog.text
+    assert all(record.levelno == logging.DEBUG for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("device", None),
+        ("device", ""),
+        ("device", "   "),
+        ("device", 42),
+        ("ble_mac", None),
+        ("ble_mac", []),
+        ("ble_mac", "unknown"),
+        ("ble_mac", "00:00:00:00:00:00"),
+        ("ble_mac", "FF:FF:FF:FF:FF:FF"),
+        ("ip", None),
+        ("ip", ""),
+        ("ip", 123),
+        ("ip", "not-an-ip"),
+        ("ip", "192.0.2.999"),
+        ("ip", "::1"),
+        ("ip", "0.0.0.0"),
+        ("ip", "255.255.255.255"),
+        ("ip", "224.0.0.1"),
+    ],
+)
+def test_discovery_rejects_invalid_required_fields(field, value, caplog):
+    """Unusable device identities and network addresses are isolated to one reply."""
+    invalid_device = {**DISCOVERY_DEVICE, field: value}
+    _assert_discovery_rejects_result(invalid_device, caplog)
+
+
+@pytest.mark.parametrize("field", ["device", "ble_mac", "ip"])
+def test_discovery_rejects_missing_required_fields(field, caplog):
+    """Each required field must be present even when the UDP sender is usable."""
+    invalid_device = {
+        key: value for key, value in DISCOVERY_DEVICE.items() if key != field
+    }
+    _assert_discovery_rejects_result(invalid_device, caplog)
+
+
+def _assert_discovery_rejects_result(result, caplog):
+    api = MarstekAPI("255.255.255.255")
+    caplog.set_level(logging.DEBUG, logger=API_MODULE)
+    with patch(f"{API_MODULE}.socket.socket") as socket_factory:
+        connection = socket_factory.return_value.__enter__.return_value
+        connection.recvfrom.side_effect = [
+            (discovery_packet(result), ("192.0.2.1", 30000)),
+            (discovery_packet(), ("192.0.2.1", 30000)),
+            TimeoutError(),
+        ]
+        assert api.discover_devices() == [DISCOVERY_DEVICE]
+        assert connection.recvfrom.call_count == 3
+    assert "Ignored discovery packet" in caplog.text
+    assert all(record.levelno == logging.DEBUG for record in caplog.records)
+
+
+def test_discovery_uses_sender_instead_of_stale_reported_ip(caplog):
+    """A sane but stale firmware address must not redirect subsequent connections."""
+    api = MarstekAPI("255.255.255.255")
+    caplog.set_level(logging.DEBUG, logger=API_MODULE)
+    with patch(f"{API_MODULE}.socket.socket") as socket_factory:
+        connection = socket_factory.return_value.__enter__.return_value
+        connection.recvfrom.side_effect = [
+            (discovery_packet(), ("192.0.2.2", 45678)),
+            TimeoutError(),
+        ]
+        assert api.discover_devices() == [{**DISCOVERY_DEVICE, "ip": "192.0.2.2"}]
+    assert "using sender" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "sender", ["0.0.0.0", "224.0.0.1", "255.255.255.255", "bad-ip"]
+)
+def test_discovery_rejects_invalid_sender(sender):
+    """An unusable network source cannot create a device entry."""
+    with patch(f"{API_MODULE}.socket.socket") as socket_factory:
+        connection = socket_factory.return_value.__enter__.return_value
+        connection.recvfrom.side_effect = [
+            (discovery_packet(), (sender, 30000)),
+            (discovery_packet(), ("192.0.2.1", 30000)),
+            TimeoutError(),
+        ]
+        assert MarstekAPI("255.255.255.255").discover_devices() == [DISCOVERY_DEVICE]
+        assert connection.recvfrom.call_count == 3
+
+
+@pytest.mark.parametrize("valid_reply", [False, True])
+@pytest.mark.parametrize("continuous_noise", [False, True])
+def test_discovery_packets_do_not_extend_deadline(
+    valid_reply, continuous_noise, caplog
+):
+    """A quiet timeout or continuous noise returns devices collected so far."""
+    api = MarstekAPI("255.255.255.255", timeout=5.0)
+    now = 0.0
+    received = 0
+
+    def receive(_size):
+        nonlocal now, received
+        received += 1
+        if received == 1:
+            now = 2.0
+            return (discovery_packet() if valid_reply else b"noise"), (
+                "192.0.2.1",
+                30000,
+            )
+        now = 5.0
+        if continuous_noise:
+            return b"noise", ("192.0.2.99", 30000)
+        raise TimeoutError
+
+    caplog.set_level(logging.DEBUG, logger=API_MODULE)
+    with (
+        patch(f"{API_MODULE}.monotonic", side_effect=lambda: now),
+        patch(f"{API_MODULE}.socket.socket") as socket_factory,
+    ):
+        connection = socket_factory.return_value.__enter__.return_value
+        connection.recvfrom.side_effect = receive
+        assert api.discover_devices() == ([DISCOVERY_DEVICE] if valid_reply else [])
+        assert received == 2
+        assert [call.args[0] for call in connection.settimeout.call_args_list] == [
+            5,
+            5,
+            3,
+        ]
+        connection.sendto.assert_called_once()
+        assert api._next_request_at == 7.5
+    assert all(record.levelno == logging.DEBUG for record in caplog.records)
+
+
+def test_discovery_timeout_without_replies(caplog):
+    """No responders still means an empty discovery result without error logs."""
+    with patch(f"{API_MODULE}.socket.socket") as socket_factory:
+        connection = socket_factory.return_value.__enter__.return_value
+        connection.recvfrom.side_effect = TimeoutError
+        assert MarstekAPI("255.255.255.255").discover_devices() == []
+        assert connection.recvfrom.call_count == 1
+    assert all(record.levelno == logging.DEBUG for record in caplog.records)

@@ -97,7 +97,10 @@ def test_transport_exceptions_leave_a_quiet_gap(transport_clock, failure_at):
     api = MarstekAPI("192.0.2.1")
     with patch(f"{API_MODULE}.socket.socket") as socket:
         connection = socket.return_value.__enter__.return_value
-        connection.recvfrom.return_value = (b"invalid", (api.host, api.port))
+        connection.recvfrom.side_effect = [
+            (b"invalid", (api.host, api.port)),
+            TimeoutError(),
+        ]
         if failure_at == "open":
             socket.side_effect = OSError("cannot open socket")
         elif failure_at == "send":
@@ -110,6 +113,7 @@ def test_transport_exceptions_leave_a_quiet_gap(transport_clock, failure_at):
 
         socket.side_effect = None
         connection.sendto.side_effect = None
+        connection.recvfrom.side_effect = None
         connection.recvfrom.return_value = (
             b'{"id":2,"result":{}}',
             (api.host, api.port),
@@ -154,6 +158,11 @@ def test_concurrent_calls_share_one_transport_slot(
     sent = []
     closed_at = []
     connections = []
+    discovered_device = {
+        "device": "Venus A",
+        "ble_mac": "AA:BB:CC:DD:EE:01",
+        "ip": api.host,
+    }
 
     def open_socket(*_args):
         index = len(connections)
@@ -179,6 +188,8 @@ def test_concurrent_calls_share_one_transport_slot(
             if (index == 0 and first_fails) or reply_count > 1:
                 raise TimeoutError
             result = {"set_result": True} if payload["method"] == "ES.SetMode" else {}
+            if payload["method"] == "Marstek.GetDevice":
+                result = discovered_device
             return json.dumps({"id": payload["id"], "result": result}).encode(), (
                 api.host,
                 api.port,
@@ -215,7 +226,7 @@ def test_concurrent_calls_share_one_transport_slot(
         first_result = first_task.result(timeout=5)
         second_result = second_task.result(timeout=5)
 
-    expected_success = {"poll": {}, "command": True, "discover": [{"ip": api.host}]}
+    expected_success = {"poll": {}, "command": True, "discover": [discovered_device]}
     expected_failure = {"poll": None, "command": False, "discover": []}
     assert (
         first_result == (expected_failure if first_fails else expected_success)[first]

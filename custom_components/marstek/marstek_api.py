@@ -4,8 +4,11 @@ import json
 import logging
 import socket
 from contextlib import contextmanager
+from ipaddress import IPv4Address
 from threading import Lock
 from time import monotonic, sleep
+
+from .identity import normalize_mac
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -190,6 +193,7 @@ class MarstekAPI:
         }
 
         devices = []
+        seen_macs = set()
 
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -207,16 +211,30 @@ class MarstekAPI:
                     request["params"],
                 )
                 sock.sendto(message, (broadcast_address, self.port))
+                deadline = monotonic() + self.timeout
 
                 try:
                     while True:
+                        remaining = deadline - monotonic()
+                        if remaining <= 0:
+                            break
+                        sock.settimeout(remaining)
                         data, addr = sock.recvfrom(4096)
-                        response = json.loads(data.decode("utf-8"))
-
-                        if "result" in response:
-                            device_info = response["result"]
-                            device_info["ip"] = addr[0]
-                            devices.append(device_info)
+                        device_info = self._parse_discovery_response(
+                            data, addr[0], request["id"]
+                        )
+                        if device_info is None:
+                            continue
+                        mac = normalize_mac(device_info["ble_mac"])
+                        if mac in seen_macs:
+                            _LOGGER.debug(
+                                "Ignored discovery packet: duplicate device sender=%s ble_mac=%s",
+                                addr[0],
+                                mac,
+                            )
+                            continue
+                        seen_macs.add(mac)
+                        devices.append(device_info)
 
                 except TimeoutError:
                     pass
@@ -225,6 +243,90 @@ class MarstekAPI:
             _LOGGER.error("Error during device discovery: %s", err)
 
         return devices
+
+    @staticmethod
+    def _parse_discovery_response(
+        data: bytes, sender: str, request_id: int
+    ) -> dict | None:
+        """Validate one broadcast reply without affecting other responders."""
+        try:
+            response = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            # ValueError also covers JSON numbers exceeding Python's digit limit.
+            _LOGGER.debug("Ignored discovery packet: invalid JSON sender=%s", sender)
+            return None
+
+        reason = None
+        if not isinstance(response, dict):
+            reason = "non-object response"
+        elif "id" not in response:
+            reason = "missing request ID"
+        elif type(response["id"]) is not int:
+            # Match normal requests: bools, floats and strings are not integer IDs.
+            reason = "invalid request ID type"
+        elif response["id"] != request_id:
+            reason = "mismatching request ID"
+        elif "error" in response:
+            error = response["error"]
+            if (
+                isinstance(error, dict)
+                and type(error.get("code")) is int
+                and isinstance(error.get("message"), str)
+            ):
+                reason = f"API error response: {error['code']} - {error['message']}"
+            else:
+                reason = "invalid API error response"
+        elif not isinstance(response.get("result"), dict):
+            reason = "missing/invalid result"
+
+        if reason is not None:
+            _LOGGER.debug(
+                "Ignored discovery packet: %s sender=%s request_id=%s",
+                reason,
+                sender,
+                request_id,
+            )
+            return None
+
+        result = response["result"]
+        device = result.get("device")
+        if (
+            not isinstance(device, str)
+            or not device.strip()
+            or normalize_mac(result.get("ble_mac")) is None
+            or not isinstance(result.get("ip"), str)
+        ):
+            _LOGGER.debug(
+                "Ignored discovery packet: missing/invalid required device fields sender=%s",
+                sender,
+            )
+            return None
+
+        try:
+            reported_ip = IPv4Address(result["ip"])
+            source_ip = IPv4Address(sender)
+        except ValueError:
+            _LOGGER.debug(
+                "Ignored discovery packet: invalid IP address sender=%s", sender
+            )
+            return None
+        if any(
+            ip.is_unspecified or ip.is_multicast or ip == IPv4Address("255.255.255.255")
+            for ip in (reported_ip, source_ip)
+        ):
+            _LOGGER.debug(
+                "Ignored discovery packet: non-unicast IP address sender=%s", sender
+            )
+            return None
+
+        # Firmware may advertise an old address; always connect to the UDP sender.
+        if reported_ip != source_ip:
+            _LOGGER.debug(
+                "Discovery IP mismatch: reported=%s sender=%s; using sender",
+                reported_ip,
+                sender,
+            )
+        return {**result, "ip": sender}
 
     def get_device_info(self) -> dict | None:
         """Get device information."""

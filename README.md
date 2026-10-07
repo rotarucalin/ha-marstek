@@ -188,12 +188,12 @@ Create custom schedules for charging/discharging, one schedule slot (`time_num`)
 Direct control of battery power. Use the `number.marstek_passive_power` entity or the `marstek.set_operating_mode_passive` service to control the battery:
 - Positive values: Discharge to grid
 - Negative values: Charge from grid
-- The integration resends the configured power every 180 seconds to work around the device's passive-mode timeout. A failed send retains the target and retries after 15 seconds, repeating until a command succeeds and restores the normal 180-second cadence. This also covers failed initial commands and poll-driven verification resends.
-- `sensor.marstek_passive_power_state` reports whether the target is `sent` (awaiting confirmation or measured output outside tolerance), `acknowledged` (measured output within tolerance), `retrying` (confirmation failed, resent), or `unknown` (output unavailable/stale or control stopped). Acknowledgement compares `ES.GetStatus` output with the desired physical power, including 0 W, using the existing tolerance of 20% or 10 W, whichever is greater. `ES.GetMode` is used for mode reporting and diagnostics; its value or availability does not affect acknowledgement. Successful keepalives preserve acknowledgement when the latest valid output still matches. At startup, before the first Passive command, the state remains `acknowledged` as a readiness signal.
+- For a non-zero target, the integration resends the configured power on its keepalive interval (180 seconds by default) and retries failed sends. This maintains control internally; the caller-supplied `cd_time` value does not set the Passive duration. A failed initial send is retried after 15 seconds; keepalive failures use bounded retry backoff. Poll-driven verification can also resend the target.
+- `sensor.marstek_passive_power_state` reports `sent` (awaiting output confirmation or measured output outside tolerance), `acknowledged` (startup readiness, or measured output within tolerance), `retrying` (a command is being retried), or `unknown` (output unavailable/stale or control stopped). After a command, acknowledgement compares fresh `ES.GetStatus` output with the desired physical power using a tolerance of 20% or 10 W, whichever is greater. It does not confirm that the device is currently in Passive mode; `ES.GetMode` is used separately for mode reporting and diagnostics. At startup, `acknowledged` is a readiness signal so automations can issue their first command. A requested power of 0 W is idle: operating mode is not relevant and no Passive keepalive is scheduled. An automation may wait for `acknowledged` after requesting 0 W before issuing its next non-zero command.
 
 **Note**: Selecting "Passive" via the operating mode select entity does **not** automatically send a power command. You must explicitly set the desired power using the number entity or the `set_operating_mode_passive` service. This prevents unintended intermediate power values when switching modes.
 
-Only one Passive keepalive/retry timer is maintained per battery. New commands replace the pending timer and invalidate queued callbacks; retries use the current target. Selecting another operating mode, stopping Passive control, or unloading the integration cancels maintenance. No automation retry loop is needed. The Passive Power number reports the maintained target, while the separate Grid Power sensor reports the device's measured `ongrid_power`.
+Only one Passive keepalive/retry timer is maintained per battery. New commands replace the pending timer and invalidate queued callbacks; retries use the current target. A 0 W idle target needs no keepalive. Selecting another operating mode, stopping Passive control, or unloading the integration cancels maintenance. No automation retry loop is needed. The Passive Power number reports the maintained target, while the separate Grid Power sensor reports the device's measured `ongrid_power`.
 
 #### Adaptive power compensation
 
@@ -219,7 +219,7 @@ Enable `custom_components.marstek: debug` in Home Assistant's logger configurati
 - `operating_mode_select`: an explicit Auto or AI selection. Selecting Manual here always fails (see [Manual Mode](#manual-mode)); nothing is logged as a command since none is sent.
 - `set_operating_mode_manual`: a Manual schedule slot written through the service.
 
-Routine successful keepalives and timer scheduling are silent. A failed command produces one WARNING with the next action; underlying transport/protocol errors add DEBUG details. Retry attempts and their results remain visible at DEBUG. An `ES.SetMode` command is logged as successful only when `set_result` is present in the API response result and its value is the literal JSON boolean `true` (`result.get("set_result") is True`). Transport success alone does not mean the command was acknowledged. Confirmation of reported mode/power remains a separate polling step; a verification mismatch logs the desired and commanded power alongside the reported mode and power before retrying.
+Routine successful keepalives and timer scheduling are silent. A failed command produces one WARNING with the next action; underlying transport/protocol errors add DEBUG details. Retry attempts and their results remain visible at DEBUG. An `ES.SetMode` command is logged as successful only when `set_result` is present in the API response result and its value is the literal JSON boolean `true` (`result.get("set_result") is True`). Transport success alone does not mean the API accepted the command. The reported operating mode is polled separately; fresh measured output is what confirms a Passive power target. A verification mismatch logs the desired and commanded power alongside the reported mode and power before retrying.
 
 While a Passive target is maintained, a separate DEBUG line traces the three power values and where the command came from:
 
@@ -267,7 +267,7 @@ service: marstek.set_operating_mode_passive
 data:
   entity_id: select.marstek_operating_mode
   power: 800      # Desired real output in watts (-3000 to 3000). Positive = discharge, negative = charge.
-  cd_time: 3600   # Retained for compatibility; ignored by the integration.
+  cd_time: 3600   # Retained for compatibility; currently ignored.
 ```
 
 `power` is the real output you want, not the raw device command — see [Adaptive power compensation](#adaptive-power-compensation) above. Resolution failures or a device-rejected command raise an error to the caller rather than failing silently.
@@ -287,7 +287,7 @@ automation:
         data:
           entity_id: select.marstek_operating_mode
           power: -2000   # Charge at 2000W
-          cd_time: 3600  # Run for 1 hour
+          cd_time: 3600  # Retained for compatibility; currently ignored.
 ```
 
 ### Discharge to Grid During Peak Hours
@@ -303,7 +303,7 @@ automation:
         data:
           entity_id: select.marstek_operating_mode
           power: 1500    # Discharge at 1500W
-          cd_time: 3600  # Run for 1 hour
+          cd_time: 3600  # Retained for compatibility; currently ignored.
 ```
 
 ### Return to Auto Mode
@@ -417,8 +417,10 @@ Assistant to probe the meter again after reconnecting the CT. Meter timeouts,
 API errors use endpoint backoff; only an
 explicit disconnected state disables this endpoint.
 
-Passive command failures retain their existing 15-second retry and successful
-commands their 180-second keepalive; the transport adds no immediate retries.
+Failed initial Passive commands retain their existing 15-second retry, and
+successful non-zero Passive targets receive their configured keepalive (180
+seconds by default); 0 W idle targets need no keepalive. The transport adds no
+immediate retries.
 These timers run after the command completes; a command can also wait for an
 in-flight request and the quiet interval. Pending commands take precedence over
 queued reads, including commands waiting behind another command. An active UDP
@@ -464,15 +466,19 @@ and the 2.5-second gap apply regardless of logging verbosity.
 
 ### Enable Debug Logging
 
-Passive control acknowledges output only when fresh `ES.GetStatus` and
-`ES.GetMode` power readings agree. The energy-system status remains the measured
-output used by both verification and calibration. Cached, missing, invalid, or
-conflicting readings cannot acknowledge a command or enter calibration. Between
+Passive output acknowledgement uses fresh `ES.GetStatus` power and does not
+require confirmation of the operating mode from `ES.GetMode`. `acknowledged` at
+startup is a readiness signal, not confirmation that the device is in Passive
+mode; after a command it means the measured output is within tolerance of the
+requested power. For a 0 W target, this is an idle state: mode is irrelevant and
+no Passive keepalive is required. Automations may wait for `acknowledged` after
+requesting 0 W before issuing the next non-zero command. Cached, missing, or
+invalid ES output cannot acknowledge a command or enter calibration. Between
 scheduled mode reads, matching fresh ES output can maintain an existing
 acknowledgement; this does not acknowledge a new command or add calibration samples.
 
 An unexpected near-zero reading while charging, or disagreement between the
-endpoints, triggers one necessary follow-up round through the existing 2.5-second request
+ES status and mode endpoints, triggers one necessary follow-up round through the existing 2.5-second request
 gate. A confirmed charging interruption resends the maintained compensated
 command only with fresh charging permission and SOC below 100%. Unknown or denied
 permission pauses automatic maintenance until fresh telemetry permits recovery;
@@ -506,7 +512,10 @@ logger:
 
 ## API Protocol
 
-This integration uses the Marstek Open API via UDP with JSON-RPC format. The API provides:
+This integration is based on the Marstek Open API Rev 3.1 and uses UDP with
+JSON-RPC format. Where the specification is incomplete or inconsistent, the
+implementation also reflects observed device behavior; those observations are
+not formal API guarantees. The API provides:
 
 - Device discovery via broadcast
 - Query commands for status information
@@ -540,4 +549,6 @@ This integration is provided "as is" for local use only. Marstek is not liable f
 
 ## Credits
 
-Developed based on the Marstek Device Open API (Rev 1.0) documentation.
+Developed based on the Marstek Device Open API (Rev 3.1), supplemented by
+observed device behavior where the specification is incomplete or inconsistent.
+Observed behavior is not a formal API guarantee.

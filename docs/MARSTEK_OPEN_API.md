@@ -4,7 +4,9 @@ Condensed from the official specification at
 <https://static-eu.marstekenergy.com/ems/resource/agreement/MarstekDeviceOpenApi.pdf>
 (22 pages, revision 3.1). This file exists so nobody has to re-download and
 re-extract the PDF to answer a question about the protocol. Where the
-integration deviates from the specification, that is recorded here too.
+integration deviates from the specification, that is recorded here too. The
+implementation also reflects observed device behavior where the specification
+is incomplete or inconsistent; those observations are not formal API guarantees.
 
 Section numbers below match the chapters in the PDF.
 
@@ -157,9 +159,12 @@ turning a mode off means setting a different mode.
 One command addresses one slot. Configuring a full schedule means sending the
 command once per `time_num`.
 
-`passive_cfg` takes `power` (W) and `cd_time` (countdown, seconds). The device
-reverts when the countdown expires, which is why passive control needs a
-keepalive.
+`passive_cfg` takes `power` (W) and `cd_time` (countdown, seconds) according to
+the Rev 3.1 specification. The specification says the device reverts when this
+countdown expires. The integration's service retains `cd_time` for backward
+compatibility, but currently ignores the supplied value and manages non-zero
+Passive maintenance internally. A 0 W request is idle and does not require a
+Passive keepalive.
 
 `ups_cfg` takes `enable`. Not implemented in this integration. Note the
 inconsistency in the PDF: the config table spells the mode `"Ups"` while the
@@ -252,8 +257,11 @@ hex serial, lowercase, drop non-alphanumerics, then match by longest prefix so
   device-local API-health throttling (see the README).
 - The device answers one request at a time. Concurrent UDP requests are not
   documented as supported.
-- Passive mode's `cd_time` means the commanded power expires. Anything that
-  wants sustained output must resend before the countdown ends.
+- The Rev 3.1 specification describes Passive `cd_time` as the commanded-power
+  countdown. The integration retains its caller-supplied `cd_time` only for
+  compatibility and currently ignores it; non-zero target maintenance is
+  managed internally. The specification's countdown description is not a
+  statement that this service argument controls the integration's duration.
 - Measured output does not match commanded power on real hardware, which is
   what this integration's passive calibration exists to correct.
 - `set_result: true` acknowledges receipt of the command, not that the device

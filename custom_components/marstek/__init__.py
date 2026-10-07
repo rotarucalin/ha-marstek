@@ -73,6 +73,17 @@ PLATFORMS: list[Platform] = [
 SCAN_INTERVAL = timedelta(seconds=30)
 # EM is disabled only on an explicit CT disconnection, not on request failure.
 OPTIONAL_SECTIONS = frozenset({"ble"})
+# The read method behind each cached section, for correlating late replies.
+SECTION_METHODS = {
+    "battery": "Bat.GetStatus",
+    "es": "ES.GetStatus",
+    "es_mode": "ES.GetMode",
+    "em": "EM.GetStatus",
+    "wifi": "Wifi.GetStatus",
+    "ble": "BLE.GetStatus",
+    "pv": "PV.GetStatus",
+}
+SECTION_KEYS = {method: key for key, method in SECTION_METHODS.items()}
 PASSIVE_POWER_RETRY_SECONDS = 15
 PASSIVE_KEEPALIVE_RETRY_SECONDS = (30, 60, 90, 120)
 PASSIVE_POWER_TOLERANCE = 0.20
@@ -144,6 +155,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await coordinator.async_stop_passive_control()
         # Flush anything the debounced save has not written yet.
         await coordinator.async_save_calibration()
+        await hass.async_add_executor_job(coordinator.api.close)
         hass.data[DOMAIN].pop(entry.entry_id)
     return unload_ok
 
@@ -1250,7 +1262,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 fresh.add(key)
             else:
                 # Never publish the pre-command snapshot after a recovery write.
-                self._last_good_data.pop(key, None)
+                self._drop_cached_section(key)
         return sequence, PassiveTelemetry(
             data.get("es_mode", {}),
             data.get("es", {}),
@@ -1269,7 +1281,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._passive_samples.clear()
         for key in ("es", "es_mode"):
             data.pop(key, None)
-            self._last_good_data.pop(key, None)
+            self._drop_cached_section(key)
 
     async def _async_process_passive_telemetry(self, data: dict, sequence: int) -> None:
         """Confirm interruptions once and publish only post-recovery telemetry."""
@@ -1433,7 +1445,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         """Hold admission until executor I/O ends, including on cancellation."""
         job = asyncio.ensure_future(self.hass.async_add_executor_job(function, *args))
         try:
-            return await asyncio.shield(job)
+            result = await asyncio.shield(job)
         except asyncio.CancelledError:
             # Cancelling an executor future cannot stop its running UDP request.
             # Drain it before releasing the scheduler slot to the next request.
@@ -1447,6 +1459,34 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             if not job.cancelled():
                 job.exception()
             raise
+        # Late replies only arrive during device I/O, so collect them here.
+        self._apply_late_results()
+        return result
+
+    def _apply_late_results(self) -> None:
+        """Cache late read data without marking it fresh or acknowledging control.
+
+        The API already rejected replies older than accepted or invalidated
+        data. Late data never counts as a fresh read, so it cannot affect
+        verification, backoff or the miss count.
+        """
+        for method, (request_id, result) in self.api.take_late_results().items():
+            key = SECTION_KEYS.get(method)
+            if key is None or key in self._disabled_optional_sections:
+                continue
+            self._last_good_data[key] = result
+            _LOGGER.debug(
+                "Marstek late section data cached: device=%s endpoint=%s "
+                "request_id=%s",
+                self.entry.title,
+                key,
+                request_id,
+            )
+
+    def _drop_cached_section(self, key: str) -> None:
+        """Forget cached data, including late replies to earlier requests."""
+        self._last_good_data.pop(key, None)
+        self.api.invalidate_reads(SECTION_METHODS[key])
 
     def _require_mode_verification(self) -> None:
         """Request faster verification only for a command or observed mismatch."""
@@ -1548,7 +1588,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._missing_cycles[key] = self._missing_cycles.get(key, 0) + 1
         if key in OPTIONAL_SECTIONS:
             self._disabled_optional_sections.add(key)
-            self._last_good_data.pop(key, None)
+            self._drop_cached_section(key)
             _LOGGER.info(
                 "Marstek optional section %s failed; skipping it until "
                 "integration reload or Home Assistant restart: device=%s",

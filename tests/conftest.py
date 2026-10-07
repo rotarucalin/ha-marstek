@@ -67,6 +67,7 @@ def mock_marstek_api():
     api.get_es_mode.return_value = {"mode": "Auto", "ongrid_power": 0}
     api.set_es_mode_passive.return_value = True
     api.set_es_mode_auto.return_value = True
+    api.take_late_results.return_value = {}
     with (
         patch("custom_components.marstek.MarstekAPI", return_value=api),
         patch("custom_components.marstek.config_flow.MarstekAPI", return_value=api),

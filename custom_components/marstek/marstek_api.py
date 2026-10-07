@@ -3,7 +3,9 @@
 import json
 import logging
 import socket
+from collections import OrderedDict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from ipaddress import IPv4Address
 from threading import Lock
 from time import monotonic, sleep
@@ -15,6 +17,29 @@ _LOGGER = logging.getLogger(__name__)
 DEFAULT_TIMEOUT = 5.0
 # Conservative workaround for firmware sensitive to closely spaced requests.
 REQUEST_GAP_SECONDS = 2.5
+# Replies to timed-out requests are still correlated within this bounded window.
+LATE_RESPONSE_WINDOW_SECONDS = 120.0
+MAX_RECENT_REQUESTS = 64
+# A mode write supersedes control telemetry requested before it.
+CONTROL_READ_METHODS = frozenset({"ES.GetStatus", "ES.GetMode", "Bat.GetStatus"})
+
+STATE_PENDING = "pending"
+STATE_COMPLETED = "completed"
+STATE_TIMED_OUT = "timed_out"
+STATE_FAILED = "failed"
+STATE_LATE = "late_received"
+
+
+@dataclass
+class RecentRequest:
+    """One transmitted request, kept briefly so a late reply can be correlated."""
+
+    request_id: int
+    method: str
+    sent_at: float
+    endpoint: tuple[str, int]
+    kind: str  # "read" or "write"
+    state: str = STATE_PENDING
 
 
 class MarstekAPI:
@@ -28,6 +53,17 @@ class MarstekAPI:
         self._request_id = 0
         self._request_lock = Lock()
         self._next_request_at = 0.0
+        # One socket keeps the local port stable, so replies that miss their
+        # deadline are still delivered and can be matched to their request.
+        self._socket: socket.socket | None = None
+        # Guards correlation state, which the event loop also reads.
+        self._state_lock = Lock()
+        self._recent: OrderedDict[int, RecentRequest] = OrderedDict()
+        # Per read method: newest request whose data was accepted, and the
+        # request at or below which late data is obsolete (invalidated).
+        self._newest_read: dict[str, int] = {}
+        self._read_floor: dict[str, int] = {}
+        self._late_results: dict[str, tuple[int, dict]] = {}
 
     @contextmanager
     def _request_slot(self):
@@ -62,6 +98,189 @@ class MarstekAPI:
             error,
         )
 
+    def close(self) -> None:
+        """Release the device socket; a later request opens a new one."""
+        with self._request_lock:
+            self._close_socket()
+
+    def _close_socket(self) -> None:
+        sock, self._socket = self._socket, None
+        if sock is not None:
+            sock.close()
+
+    def _connection(self) -> socket.socket:
+        """Return the shared request socket, opening it on first use."""
+        if self._socket is None:
+            self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        return self._socket
+
+    def _prune_recent(self, now: float) -> None:
+        """Drop requests beyond the correlation window or the size bound."""
+        while self._recent:
+            oldest = next(iter(self._recent.values()))
+            if (
+                len(self._recent) <= MAX_RECENT_REQUESTS
+                and now - oldest.sent_at <= LATE_RESPONSE_WINDOW_SECONDS
+            ):
+                break
+            self._recent.popitem(last=False)
+
+    def _register_request(
+        self, request: dict, endpoint: tuple[str, int]
+    ) -> RecentRequest:
+        method = request["method"]
+        entry = RecentRequest(
+            request["id"],
+            method,
+            monotonic(),
+            endpoint,
+            "read" if ".Get" in method else "write",
+        )
+        with self._state_lock:
+            self._recent[entry.request_id] = entry
+            self._prune_recent(entry.sent_at)
+            if method == "ES.SetMode":
+                for read_method in CONTROL_READ_METHODS:
+                    self._read_floor[read_method] = entry.request_id
+                    self._late_results.pop(read_method, None)
+        return entry
+
+    def _finish_request(self, entry: RecentRequest | None, state: str) -> None:
+        if entry is not None:
+            with self._state_lock:
+                entry.state = state
+
+    def _record_read(self, method: str, request_id: int) -> None:
+        """Note fresh data, discarding an older late reply not yet collected."""
+        with self._state_lock:
+            if request_id > self._newest_read.get(method, 0):
+                self._newest_read[method] = request_id
+            superseded = self._late_results.pop(method, None)
+        if superseded is not None:
+            _LOGGER.debug(
+                "Ignored late response because newer data exists: host=%s "
+                "request_id=%s method=%s newer_request_id=%s",
+                self.host,
+                superseded[0],
+                method,
+                request_id,
+            )
+
+    def invalidate_reads(self, method: str) -> None:
+        """Reject late replies to requests sent before the caller dropped data."""
+        with self._state_lock:
+            self._read_floor[method] = self._request_id
+            self._late_results.pop(method, None)
+
+    def take_late_results(self) -> dict[str, tuple[int, dict]]:
+        """Return accepted late read results as `{method: (request_id, result)}`."""
+        with self._state_lock:
+            results, self._late_results = self._late_results, {}
+        return results
+
+    def _handle_unmatched(self, response: dict, sender: str, request: dict) -> None:
+        """Classify a reply for another request; only a timed-out one is late."""
+        response_id = response.get("id")
+        # Requests use integer IDs, which the device must echo.
+        # Exact type checking also excludes bools and floats.
+        if type(response_id) is not int:
+            _LOGGER.debug(
+                "Ignored packet with invalid request ID: host=%s port=%s "
+                "method=%s request_id=%s response_id=%r response=%r",
+                self.host,
+                self.port,
+                request["method"],
+                request["id"],
+                response_id,
+                response,
+            )
+            return
+        if response_id == 0:
+            _LOGGER.debug(
+                "Ignored malformed response with id=0: host=%s port=%s "
+                "method=%s request_id=%s response=%r",
+                self.host,
+                self.port,
+                request["method"],
+                request["id"],
+                response,
+            )
+            return
+
+        now = monotonic()
+        newer_id = None
+        with self._state_lock:
+            self._prune_recent(now)
+            entry = self._recent.get(response_id)
+            if (
+                entry is None
+                or entry.state != STATE_TIMED_OUT
+                or entry.endpoint[0] != sender
+            ):
+                entry = None
+            else:
+                entry.state = STATE_LATE
+                result = response.get("result")
+                usable = (
+                    entry.kind == "read"
+                    and "error" not in response
+                    and isinstance(result, dict)
+                )
+                if usable:
+                    newer_id = max(
+                        self._newest_read.get(entry.method, 0),
+                        self._read_floor.get(entry.method, 0),
+                    )
+                    if newer_id < response_id:
+                        newer_id = None
+                        self._newest_read[entry.method] = response_id
+                        self._late_results[entry.method] = (response_id, result)
+
+        if entry is None:
+            _LOGGER.debug(
+                "Ignored response with unknown or expired request ID: host=%s "
+                "response_id=%s current_request_id=%s current_method=%s "
+                "response=%r",
+                self.host,
+                response_id,
+                request["id"],
+                request["method"],
+                response,
+            )
+        elif not usable:
+            # Writes are only correlated: a returned command result stands, and
+            # acknowledgement still comes from mode/status verification.
+            _LOGGER.debug(
+                "Correlated late response without applying it: host=%s "
+                "request_id=%s method=%s type=%s age=%.1fs response=%r",
+                self.host,
+                response_id,
+                entry.method,
+                entry.kind,
+                now - entry.sent_at,
+                response,
+            )
+        elif newer_id is not None:
+            _LOGGER.debug(
+                "Ignored late response because newer data exists: host=%s "
+                "request_id=%s method=%s age=%.1fs newer_request_id=%s",
+                self.host,
+                response_id,
+                entry.method,
+                now - entry.sent_at,
+                newer_id,
+            )
+        else:
+            _LOGGER.debug(
+                "Accepted late response: host=%s request_id=%s method=%s "
+                "age=%.1fs current_request_id=%s",
+                self.host,
+                response_id,
+                entry.method,
+                now - entry.sent_at,
+                request["id"],
+            )
+
     def _send_request(self, method: str, params: dict | None = None) -> dict | None:
         """Send a UDP JSON-RPC request."""
         with self._request_slot():
@@ -77,81 +296,76 @@ class MarstekAPI:
             "method": method,
             "params": params,
         }
+        entry = None
 
         try:
             # Pin sending and validation to the same IPv4 address for this request.
             resolved_ip = socket.gethostbyname(self.host)
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-                sock.settimeout(self.timeout)
-                message = json.dumps(request).encode("utf-8")
-                _LOGGER.debug(
-                    "Marstek TX: host=%s ip=%s port=%s request_id=%s method=%s params=%s",
-                    self.host,
-                    resolved_ip,
-                    self.port,
-                    request["id"],
-                    request["method"],
-                    request["params"],
-                )
-                sock.sendto(message, (resolved_ip, self.port))
-                deadline = monotonic() + self.timeout
-                while True:
-                    remaining = deadline - monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError
-                    sock.settimeout(remaining)
+            sock = self._connection()
+            sock.settimeout(self.timeout)
+            message = json.dumps(request).encode("utf-8")
+            _LOGGER.debug(
+                "Marstek TX: host=%s ip=%s port=%s request_id=%s method=%s params=%s",
+                self.host,
+                resolved_ip,
+                self.port,
+                request["id"],
+                request["method"],
+                request["params"],
+            )
+            entry = self._register_request(request, (resolved_ip, self.port))
+            sock.sendto(message, (resolved_ip, self.port))
+            deadline = monotonic() + self.timeout
+            while True:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                sock.settimeout(remaining)
+                try:
                     data, addr = sock.recvfrom(4096)
-                    if addr[0] != resolved_ip:
-                        _LOGGER.debug(
-                            "Ignored packet from unexpected sender: sender=%s "
-                            "host=%s port=%s method=%s request_id=%s",
-                            addr,
-                            self.host,
-                            self.port,
-                            method,
-                            request["id"],
-                        )
-                        continue
-                    try:
-                        response = json.loads(data.decode("utf-8"))
-                    except (UnicodeDecodeError, json.JSONDecodeError) as err:
-                        _LOGGER.debug(
-                            "Ignored malformed packet: host=%s port=%s method=%s "
-                            "request_id=%s error=%s",
-                            self.host,
-                            self.port,
-                            method,
-                            request["id"],
-                            err,
-                        )
-                        continue
-                    if not isinstance(response, dict):
-                        _LOGGER.debug(
-                            "Ignored malformed packet: host=%s port=%s method=%s "
-                            "request_id=%s expected JSON object",
-                            self.host,
-                            self.port,
-                            method,
-                            request["id"],
-                        )
-                        continue
-                    response_id = response.get("id")
-                    # Requests use integer IDs, which the device must echo.
-                    # Exact type checking also excludes bools and floats.
-                    if type(response_id) is not int or response_id != request["id"]:
-                        _LOGGER.debug(
-                            "Ignored packet with mismatching request ID: "
-                            "host=%s port=%s method=%s request_id=%s response_id=%r response=%r",
-                            self.host,
-                            self.port,
-                            method,
-                            request["id"],
-                            response_id,
-                            response,
-                        )
-                        continue
+                except ConnectionResetError:
+                    # Windows reports ICMP errors for earlier datagrams here.
+                    continue
+                if addr[0] != resolved_ip:
+                    _LOGGER.debug(
+                        "Ignored packet from unexpected sender: sender=%s "
+                        "host=%s port=%s method=%s request_id=%s",
+                        addr,
+                        self.host,
+                        self.port,
+                        method,
+                        request["id"],
+                    )
+                    continue
+                try:
+                    response = json.loads(data.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as err:
+                    _LOGGER.debug(
+                        "Ignored malformed packet: host=%s port=%s method=%s "
+                        "request_id=%s error=%s",
+                        self.host,
+                        self.port,
+                        method,
+                        request["id"],
+                        err,
+                    )
+                    continue
+                if not isinstance(response, dict):
+                    _LOGGER.debug(
+                        "Ignored malformed packet: host=%s port=%s method=%s "
+                        "request_id=%s expected JSON object",
+                        self.host,
+                        self.port,
+                        method,
+                        request["id"],
+                    )
+                    continue
+                response_id = response.get("id")
+                if type(response_id) is int and response_id == request["id"]:
                     break
+                self._handle_unmatched(response, addr[0], request)
 
+            self._finish_request(entry, STATE_COMPLETED)
             _LOGGER.debug(
                 "Marstek RX: host=%s method=%s request_id=%s response=%s",
                 self.host,
@@ -168,12 +382,19 @@ class MarstekAPI:
                 )
                 return None
 
-            return response.get("result")
+            result = response.get("result")
+            if entry.kind == "read" and result is not None:
+                self._record_read(method, request["id"])
+            return result
 
         except TimeoutError:
+            # Keep the socket: the reply may still arrive and be correlated.
+            self._finish_request(entry, STATE_TIMED_OUT)
             self._log_request_error(method, "Timeout communicating with device")
             return None
         except Exception as err:  # noqa: BLE001 - Preserve the best-effort API contract.
+            self._finish_request(entry, STATE_FAILED)
+            self._close_socket()
             self._log_request_error(method, f"{type(err).__name__}: {err}")
             return None
 

@@ -69,12 +69,12 @@ def test_gap_starts_after_completion_even_on_failure(transport_clock, reply, idl
         return False
 
     with patch(f"{API_MODULE}.socket.socket") as socket:
-        connection = socket.return_value.__enter__.return_value
+        connection = socket.return_value
         connection.sendto.side_effect = lambda *_args: sent_at.append(
             transport_clock.now
         )
         connection.recvfrom.side_effect = receive
-        socket.return_value.__exit__.side_effect = close
+        connection.close.side_effect = close
 
         result = api.get_battery_status()
         assert result == (
@@ -96,7 +96,8 @@ def test_transport_exceptions_leave_a_quiet_gap(transport_clock, failure_at):
     """Early socket failures and failed discovery cannot bypass the cooldown."""
     api = MarstekAPI("192.0.2.1")
     with patch(f"{API_MODULE}.socket.socket") as socket:
-        connection = socket.return_value.__enter__.return_value
+        connection = socket.return_value
+        connection.__enter__.return_value = connection
         connection.recvfrom.side_effect = [
             (b"invalid", (api.host, api.port)),
             TimeoutError(),
@@ -136,7 +137,7 @@ def test_transport_exceptions_leave_a_quiet_gap(transport_clock, failure_at):
 def test_concurrent_calls_share_one_transport_slot(
     transport_clock, first, second, first_fails
 ):
-    """A competing worker must wait for socket close and the full quiet gap."""
+    """A competing worker must wait for completion and the full quiet gap."""
     api = MarstekAPI("192.0.2.1")
     receiving = Event()
     release_reply = Event()
@@ -156,7 +157,7 @@ def test_concurrent_calls_share_one_transport_slot(
 
     api._request_lock = ObservedLock()
     sent = []
-    closed_at = []
+    finished_at = []
     connections = []
     discovered_device = {
         "device": "Venus A",
@@ -165,7 +166,7 @@ def test_concurrent_calls_share_one_transport_slot(
     }
 
     def open_socket(*_args):
-        index = len(connections)
+        # Requests reuse one socket; discovery opens its own broadcast socket.
         connection = MagicMock()
         connection.__enter__.return_value = connection
         connections.append(connection)
@@ -173,19 +174,22 @@ def test_concurrent_calls_share_one_transport_slot(
         reply_count = 0
 
         def send(message, _address):
-            nonlocal payload
+            nonlocal payload, reply_count
             payload = json.loads(message)
+            reply_count = 0
             sent.append((transport_clock.now, payload))
 
         def receive(_size):
             nonlocal reply_count
-            if index == 0 and reply_count == 0:
+            first = payload["id"] == 1
+            if first and reply_count == 0:
                 receiving.set()
                 if not release_reply.wait(5):
                     raise RuntimeError("Test did not release the blocked response")
             reply_count += 1
             transport_clock.now += 0.2
-            if (index == 0 and first_fails) or reply_count > 1:
+            finished_at.append(transport_clock.now)
+            if (first and first_fails) or reply_count > 1:
                 raise TimeoutError
             result = {"set_result": True} if payload["method"] == "ES.SetMode" else {}
             if payload["method"] == "Marstek.GetDevice":
@@ -197,12 +201,13 @@ def test_concurrent_calls_share_one_transport_slot(
 
         def close(*_args):
             transport_clock.now += 0.1
-            closed_at.append(transport_clock.now)
+            finished_at.append(transport_clock.now)
             return False
 
         connection.sendto.side_effect = send
         connection.recvfrom.side_effect = receive
         connection.__exit__.side_effect = close
+        connection.close.side_effect = close
         return connection
 
     actions = {
@@ -233,14 +238,15 @@ def test_concurrent_calls_share_one_transport_slot(
     )
     assert second_result == expected_success[second]
     assert [payload["id"] for _, payload in sent] == [1, 2]
-    assert sent[1][0] - closed_at[0] == pytest.approx(2.5)
+    first_done = max(t for t in finished_at if t <= sent[1][0])
+    assert sent[1][0] - first_done == pytest.approx(2.5)
     assert transport_clock.sleeps == [2.5]
 
 
 def test_different_clients_do_not_share_a_cooldown(transport_clock):
     """One slow battery must not delay another battery's first request."""
     with patch(f"{API_MODULE}.socket.socket") as socket:
-        connection = socket.return_value.__enter__.return_value
+        connection = socket.return_value
         connection.recvfrom.side_effect = [
             (b'{"id":1,"result":{}}', (host, 30000))
             for host in ("192.0.2.1", "192.0.2.2")

@@ -542,7 +542,7 @@ def test_api_includes_manual_set_only_when_given(manual_set, expected):
     """
     api = MarstekAPI("192.0.2.1")
     with patch("custom_components.marstek.marstek_api.socket.socket") as socket:
-        connection = socket.return_value.__enter__.return_value
+        connection = socket.return_value
         connection.recvfrom.return_value = (
             json.dumps({"id": 1, "result": {"set_result": True}}).encode(),
             ("192.0.2.1", 30000),

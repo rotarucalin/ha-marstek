@@ -51,7 +51,10 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     api = MarstekAPI(host=data[CONF_HOST], port=data.get(CONF_PORT, DEFAULT_PORT))
 
     # Try to get device info
-    device_info = await hass.async_add_executor_job(api.get_device_info)
+    try:
+        device_info = await hass.async_add_executor_job(api.get_device_info)
+    finally:
+        await hass.async_add_executor_job(api.close)
 
     if not isinstance(device_info, dict) or not device_info:
         raise CannotConnect

@@ -175,7 +175,7 @@ def test_pv_api_response(pv_status):
     """The real UDP client preserves the numbered PV.GetStatus result."""
     api = MarstekAPI("192.0.2.1")
     with patch("custom_components.marstek.marstek_api.socket.socket") as socket:
-        connection = socket.return_value.__enter__.return_value
+        connection = socket.return_value
         connection.recvfrom.return_value = (
             json.dumps({"id": 1, "src": "VenusA-mac", "result": pv_status}).encode(),
             ("192.0.2.1", 30000),

@@ -95,7 +95,8 @@ def test_tx_logs_wire_payload_before_send(
         patch(f"{API_MODULE}.socket.gethostbyname", return_value="192.0.2.1"),
         patch(f"{API_MODULE}.socket.socket") as socket_factory,
     ):
-        connection = socket_factory.return_value.__enter__.return_value
+        connection = socket_factory.return_value
+        connection.__enter__.return_value = connection
         connection.sendto.side_effect = send
         reply = DISCOVERY_DEVICE if discovery else {"set_result": True}
         connection.recvfrom.side_effect = [
@@ -129,7 +130,7 @@ def test_request_validates_resolved_sender(host):
         ) as resolve,
         patch(f"{API_MODULE}.socket.socket") as socket_factory,
     ):
-        connection = socket_factory.return_value.__enter__.return_value
+        connection = socket_factory.return_value
         connection.recvfrom.side_effect = [
             (b'{"id":1,"result":{"soc":50}}', ("192.0.2.1", 30000)),
             TimeoutError(),
@@ -211,7 +212,7 @@ def test_mode_success_requires_set_result(mode, args, config, response, success)
     """Transport success alone never acknowledges an operating-mode command."""
     api = MarstekAPI("192.0.2.1")
     with patch("custom_components.marstek.marstek_api.socket.socket") as socket:
-        connection = socket.return_value.__enter__.return_value
+        connection = socket.return_value
         connection.recvfrom.return_value = (
             json.dumps({"id": 1, **response}).encode(),
             ("192.0.2.1", 30000),
@@ -258,7 +259,7 @@ async def test_real_api_failure_schedules_retry_with_one_warning(
         patch("custom_components.marstek.marstek_api.socket.socket") as socket,
         patch("custom_components.marstek.async_call_later") as later,
     ):
-        connection = socket.return_value.__enter__.return_value
+        connection = socket.return_value
         if isinstance(failure, Exception):
             connection.recvfrom.side_effect = failure
         else:
@@ -284,7 +285,7 @@ async def test_real_api_failure_schedules_retry_with_one_warning(
 @pytest.mark.parametrize(
     ("packet", "sender", "diagnostic"),
     [
-        (b'{"id":0,"result":{}}', "192.0.2.1", "mismatching request ID"),
+        (b'{"id":0,"result":{}}', "192.0.2.1", "malformed response with id=0"),
         (b'{"id":1,"result":{}}', "192.0.2.2", "unexpected sender"),
         (b"invalid json", "192.0.2.1", "malformed packet"),
         (b"\xff", "192.0.2.1", "malformed packet"),
@@ -300,7 +301,7 @@ async def test_real_api_failure_schedules_retry_with_one_warning(
         (
             b'{"id":0,"error":{"code":-1,"message":"stale"}}',
             "192.0.2.1",
-            "mismatching request ID",
+            "malformed response with id=0",
         ),
     ],
 )
@@ -317,7 +318,7 @@ def test_invalid_packet_followed_by_matching_response(
         ) as resolve,
         patch(f"{API_MODULE}.socket.socket") as socket,
     ):
-        connection = socket.return_value.__enter__.return_value
+        connection = socket.return_value
         connection.recvfrom.side_effect = [
             (packet, (sender, 30000)),
             (b'{"id":1,"result":{"soc":50}}', ("192.0.2.1", api.port)),
@@ -355,7 +356,7 @@ def test_invalid_packets_do_not_reset_timeout(caplog, packets_keep_arriving):
         patch(f"{API_MODULE}.monotonic", side_effect=lambda: now),
         patch(f"{API_MODULE}.socket.socket") as socket,
     ):
-        connection = socket.return_value.__enter__.return_value
+        connection = socket.return_value
         connection.recvfrom.side_effect = receive
         assert api.get_battery_status() is None
         assert received == 2
@@ -369,7 +370,7 @@ def test_invalid_packets_do_not_reset_timeout(caplog, packets_keep_arriving):
 
     assert "Timeout communicating with device" in caplog.text
     ignored = [
-        record for record in caplog.records if "Ignored packet" in record.message
+        record for record in caplog.records if record.message.startswith("Ignored")
     ]
     assert ignored
     assert all(record.levelno == logging.DEBUG for record in ignored)
@@ -398,7 +399,7 @@ async def test_mode_command_ignores_mismatching_responses(
         patch(f"{API_MODULE}.socket.socket") as socket,
         patch("custom_components.marstek.async_call_later") as later,
     ):
-        connection = socket.return_value.__enter__.return_value
+        connection = socket.return_value
         connection.recvfrom.side_effect = [
             (packet, ("192.0.2.1", 30000)),
             (

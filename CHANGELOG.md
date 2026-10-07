@@ -1,6 +1,46 @@
 # Changelog
 
-## Unreleased
+## 2.8.0.0
+
+### Changed: Late UDP replies are correlated instead of discarded
+
+A reply that arrived after its request timed out used to be lost. Each request
+opened its own socket, so the reply reached a closed port, and request-ID
+validation would have rejected it anyway because a newer request was active.
+
+- Each device now uses one long-lived UDP socket, so late replies are still
+  delivered. Discovery keeps its own short-lived broadcast socket.
+- A bounded registry tracks the last 64 requests for 120 seconds, with request
+  ID, method, send time, endpoint, read/write type, and completion or timeout
+  state.
+- A reply to a recently timed-out request is accepted as a late reply. Replies
+  with unknown, expired or already answered IDs are ignored. Replies with
+  `id=0` are still rejected as malformed.
+- A late read updates only its own endpoint's cached data, and only if no
+  newer request for that endpoint has produced data. For example, if request
+  74 times out and request 75 succeeds, a late reply to 74 is discarded. If 75
+  also failed, 74 is used.
+- Late data is never treated as a fresh read. It does not acknowledge Passive
+  power, satisfy mode verification, reset the miss count or affect backoff. It
+  only updates what the integration serves until the next successful read.
+- Data the integration drops on purpose, such as readings superseded by a
+  Passive recovery command, cannot come back through a late reply. A mode
+  write also supersedes ES status, ES mode and battery readings requested
+  before it.
+- Late `ES.SetMode` replies are logged but never applied. A command that
+  already returned a failure stays failed. Acknowledgement still comes only
+  from mode/status verification.
+- New debug messages: `Accepted late response`, `Ignored late response because
+  newer data exists`, `Ignored response with unknown or expired request ID`,
+  `Ignored malformed response with id=0`, and `Correlated late response
+  without applying it`. Each includes the request ID, the method and the age
+  since TX, plus the newer request ID where relevant.
+
+No requests or retries are added. Request serialization, the 2.5 s quiet gap,
+timeouts, endpoint backoff, degraded API mode, polling intervals and SetMode
+acknowledgement/retry logic are unchanged.
+
+## 2.7.0.0
 
 ### Changed: Much lower read polling, with a temporary fast profile for control
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.8.1.0
 
 ### Fixed: Passive control could lapse while the API was degraded
 

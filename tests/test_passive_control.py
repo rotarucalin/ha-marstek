@@ -16,6 +16,7 @@ from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from custom_components.marstek import (
+    PASSIVE_KEEPALIVE_RETRY_SECONDS,
     PASSIVE_POWER_RETRY_SECONDS,
     MarstekDataUpdateCoordinator,
 )
@@ -226,12 +227,13 @@ async def test_new_target_and_successful_keepalive(
 async def test_failed_keepalives_retry_until_success(
     coordinator, command_timers, mock_marstek_api, caplog, failure
 ):
-    """All failure forms retain the target and retry at 15s until accepted."""
+    """All failure forms retain the target and back off until accepted."""
+    assert PASSIVE_KEEPALIVE_RETRY_SECONDS == (30, 60, 90, 120)
     mock_marstek_api.set_es_mode_passive.side_effect = [True, failure, failure, True]
     assert await coordinator.async_set_passive_power(240)
     caplog.clear()
     await command_timers.current.fire()
-    assert command_timers.current.delay == 15
+    assert command_timers.current.delay == 30
     assert coordinator._passive_desired_power == 240
     assert not outgoing_messages(caplog)
     warnings = [
@@ -239,13 +241,14 @@ async def test_failed_keepalives_retry_until_success(
     ]
     assert len(warnings) == 1
     assert "source=keepalive " in warnings[0].message
+    assert "keepalive retry uses bounded backoff" in warnings[0].message
     assert "Marstek command succeeded:" not in caplog.text
-    assert "retry in 15s" in caplog.text
+    assert "next retry in 30s" in caplog.text
     assert "Marstek command scheduled:" not in caplog.text
 
     caplog.clear()
     await command_timers.current.fire()
-    assert command_timers.current.delay == 15
+    assert command_timers.current.delay == 60
     assert coordinator._passive_desired_power == 240
     assert "source=keepalive_retry" in outgoing_messages(caplog)[0]
     assert "Marstek command succeeded:" not in caplog.text
@@ -278,7 +281,7 @@ async def test_internal_keepalive_failure_never_raises_a_service_exception(
     await keepalive.fire()  # must not raise
 
     assert coordinator._passive_desired_power == 240
-    assert command_timers.current.delay == 15
+    assert command_timers.current.delay == PASSIVE_KEEPALIVE_RETRY_SECONDS[0]
 
 
 async def test_failed_initial_target_also_retries(
@@ -1197,11 +1200,17 @@ async def test_one_retry_path_preserves_origin_until_success(
         else:
             assert await verify_mismatch(coordinator)
 
+    # Only keepalive failures back off; other failed commands retry at a fixed pace.
+    expected_delays = (
+        PASSIVE_KEEPALIVE_RETRY_SECONDS[:3]
+        if origin == "keepalive"
+        else (PASSIVE_POWER_RETRY_SECONDS,) * 3
+    )
     first_retry = command_timers.current
-    for _ in range(3):
+    for expected_delay in expected_delays:
         retry = coordinator._passive_retry
         timer = command_timers.current
-        assert timer.delay == PASSIVE_POWER_RETRY_SECONDS
+        assert timer.delay == expected_delay
         assert (retry.desired_w, retry.command_w, retry.source) == (240, 253, origin)
         assert coordinator._passive_keepalive_cancel is None
         calls = mock_marstek_api.set_es_mode_passive.call_count
@@ -1307,7 +1316,12 @@ async def test_verification_and_keepalive_return_while_command_in_flight(
             await sending
     assert not coordinator._passive_command_in_flight
     assert (coordinator._passive_retry is None) is success
-    assert command_timers.current.delay == (180 if success else 15)
+    retry_delay = (
+        PASSIVE_KEEPALIVE_RETRY_SECONDS[0]
+        if origin == "keepalive"
+        else PASSIVE_POWER_RETRY_SECONDS
+    )
+    assert command_timers.current.delay == (180 if success else retry_delay)
 
 
 @pytest.mark.parametrize("new_power", [240, 300])

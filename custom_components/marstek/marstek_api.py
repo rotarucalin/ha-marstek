@@ -10,6 +10,7 @@ from ipaddress import IPv4Address
 from threading import Lock
 from time import monotonic, sleep
 
+from .const import PASSIVE_CD_TIME_SECONDS
 from .identity import normalize_mac
 
 _LOGGER = logging.getLogger(__name__)
@@ -641,7 +642,9 @@ class MarstekAPI:
         result = self._send_request("ES.SetMode", params)
         return isinstance(result, dict) and result.get("set_result") is True
 
-    def set_es_mode_passive(self, power: int, cd_time: int = 3600) -> bool:
+    def set_es_mode_passive(
+        self, power: int, cd_time: int = PASSIVE_CD_TIME_SECONDS
+    ) -> bool:
         """Set energy system to Passive mode."""
         params = {
             "id": 0,

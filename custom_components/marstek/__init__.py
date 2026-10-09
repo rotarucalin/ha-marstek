@@ -32,6 +32,8 @@ from .const import (
     MODE_AUTO,
     MODE_MANUAL,
     MODE_PASSIVE,
+    PASSIVE_CD_TIME_SECONDS,
+    PASSIVE_COUNTDOWN_MARGIN_SECONDS,
     PASSIVE_DEADBAND_W,
     PASSIVE_MIN_LEARN_POWER_W,
     PASSIVE_RESEND_THRESHOLD_W,
@@ -244,6 +246,8 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._passive_power_state = PASSIVE_STATE_ACKNOWLEDGED
         self._passive_send_sequence = 0
         self._passive_last_send_at = 0.0
+        # When the last accepted Passive write was sent, starting its countdown.
+        self._passive_last_ack_at: float | None = None
         self._last_passive_command: dict | None = None
         self._passive_poll_active = False
         self._passive_charge_recovery_blocked = False
@@ -758,6 +762,8 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._cancel_passive_retry()
         generation = self._passive_target_generation
         self._passive_command_in_flight = True
+        # Taken before the request, so the countdown is never thought to start late.
+        sent_at = monotonic()
         try:
             success = await self._async_send_mode_command(
                 mode=MODE_PASSIVE, power=self._passive_command_power, source=source
@@ -765,6 +771,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         finally:
             self._passive_command_in_flight = False
         if success:
+            self._passive_last_ack_at = sent_at
             self._passive_last_success_sequence = self._passive_send_sequence
             if source.removesuffix("_retry") == "keepalive":
                 self._reset_passive_keepalive_retry_backoff(log=True)
@@ -813,6 +820,15 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             )
             return True
         return False
+
+    def _passive_countdown_remaining(self) -> float:
+        """Return seconds until the device's Passive `cd_time` expires.
+
+        Without an accepted write the countdown is treated as already expired.
+        """
+        if self._passive_last_ack_at is None:
+            return 0.0
+        return PASSIVE_CD_TIME_SECONDS - (monotonic() - self._passive_last_ack_at)
 
     def _reset_passive_keepalive_retry_backoff(self, *, log: bool = False) -> None:
         """Restart keepalive retry backoff from 30 seconds."""
@@ -901,16 +917,26 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 return
             self._passive_retry = None
             if retry.source == "keepalive" and self._polling.degraded:
-                delay = retry.delay_seconds or PASSIVE_KEEPALIVE_RETRY_SECONDS[0]
+                remaining = self._passive_countdown_remaining()
+                if remaining > PASSIVE_COUNTDOWN_MARGIN_SECONDS:
+                    delay = retry.delay_seconds or PASSIVE_KEEPALIVE_RETRY_SECONDS[0]
+                    _LOGGER.debug(
+                        "Marstek passive keepalive retry suppressed because API is "
+                        "degraded: device=%s retry_in=%ss countdown_remaining=%ss",
+                        self.entry.title,
+                        delay,
+                        round(remaining),
+                    )
+                    # No write happened: recheck later without advancing backoff.
+                    self._arm_passive_retry(retry, delay)
+                    return
+                # Holding back any longer would let the device leave Passive.
                 _LOGGER.debug(
-                    "Marstek passive keepalive retry suppressed because API is "
-                    "degraded: device=%s retry_in=%ss",
+                    "Marstek passive keepalive retry sent despite degraded API: "
+                    "device=%s countdown_remaining=%ss",
                     self.entry.title,
-                    delay,
+                    round(remaining),
                 )
-                # No write happened: recheck later without advancing backoff.
-                self._arm_passive_retry(retry, delay)
-                return
             # Failed sends and their observations must not contribute samples
             # to calibration after recovery succeeds.
             self._passive_samples.clear()
@@ -945,10 +971,11 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         )
         _LOGGER.debug(
             "Marstek passive keepalive scheduled: device=%s desired_w=%s "
-            "keepalive_interval=%ss cd_time=3600s",
+            "keepalive_interval=%ss cd_time=%ss",
             self.entry.title,
             self._passive_desired_power,
             self._passive_keepalive_seconds,
+            PASSIVE_CD_TIME_SECONDS,
         )
 
     def _cancel_passive_keepalive(self) -> None:
@@ -970,6 +997,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._passive_command_power = None
         self._passive_command_source = SOURCE_DIRECT
         self._passive_last_send_ok = False
+        self._passive_last_ack_at = None
         self._passive_charge_recovery_blocked = False
         self._passive_samples.clear()
         self._passive_send_sequence += 1

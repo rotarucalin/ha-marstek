@@ -392,7 +392,11 @@ timeouts. Intervals and caps can be overridden per coordinator through its
 Three different failing read endpoints within 120 seconds put that device's API
 health into `degraded`. Nonessential reads pause, while `ES.GetStatus` probes run
 no more frequently than every 120 seconds, subject to endpoint backoff. Commands,
-Passive retries, keepalives, and necessary verification remain available.
+scheduled keepalives, retries of new targets, and necessary verification remain
+available. A retry after a failed keepalive is held back while degraded, until
+the device's 3600-second Passive countdown (`cd_time`, counted from the last
+accepted Passive write) has 10 minutes or less left. From then on it is sent
+with its normal backoff, so a degraded API cannot let the device leave Passive.
 Recovery requires at least three consecutive successful communications spanning
 at least 60 seconds; a failure restarts that recovery count. Both health
 transitions and scheduling changes are logged at DEBUG. Each device has its own

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Fixed: Passive control could lapse while the API was degraded
+
+A keepalive schedules the next one only when it succeeds. After a failed
+keepalive, the retry is the only thing that sends Passive again. While the API
+was degraded, that retry was held back with no time limit. If the API stayed
+degraded for the rest of the device's 3600-second `cd_time` countdown, the
+device left Passive even though Home Assistant still held the target.
+
+- The integration now records when the device last accepted a Passive write.
+- A held-back keepalive retry is sent anyway once 10 minutes or less remain on
+  the countdown. If it fails, it keeps retrying with the normal 30/60/90/120 s
+  backoff.
+- Outside that window, degraded mode still holds the retry back as before.
+
 ## 2.8.0.0
 
 ### Changed: Late UDP replies are correlated instead of discarded

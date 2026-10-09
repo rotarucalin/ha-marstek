@@ -69,6 +69,12 @@ PASSIVE_COMMAND_MIN = -3000
 PASSIVE_COMMAND_MAX = 3000
 PASSIVE_RESEND_THRESHOLD_W = 5
 
+# Every Passive command sends this `cd_time`; the device leaves Passive when it
+# expires without a newer accepted command (Open API 3.6). A degraded API holds
+# back keepalive retries, except within this margin before the expiry.
+PASSIVE_CD_TIME_SECONDS = 3600
+PASSIVE_COUNTDOWN_MARGIN_SECONDS = 600
+
 # The command range defaults to PASSIVE_COMMAND_MAX. This is a conservative
 # fallback for models the Open API (Rev 3.1, chapter 4) does not document a
 # power rating for (Venus C, Venus E mini) or that were not recognised at all;

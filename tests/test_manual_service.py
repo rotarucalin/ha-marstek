@@ -11,10 +11,12 @@ import pytest
 import voluptuous as vol
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util.yaml.loader import parse_yaml
 
 from custom_components.marstek.const import DOMAIN, MANUAL_SET_AUTO
 from custom_components.marstek.services import (
     SERVICE_SET_OPERATING_MODE_MANUAL,
+    _validate_hhmm,
     async_register_services,
 )
 
@@ -180,7 +182,66 @@ async def test_manual_service_raises_for_an_unresolved_entity(hass):
         await _call_manual(hass, **_base_data("select.unknown_marstek_entity"))
 
 
-@pytest.mark.parametrize("bad_time", ["8:00", "24:00", "12:60", "noon", ""])
+async def test_manual_service_accepts_ui_time_selector_values(
+    hass, marstek_entry, mock_marstek_api
+):
+    """The UI's time selector sends seconds; the device receives HH:MM."""
+    entity_id = await _setup_model(hass, marstek_entry, mock_marstek_api, "Venus D")
+    mock_marstek_api.set_es_mode_manual.return_value = True
+
+    await _call_manual(
+        hass,
+        **_base_data(entity_id, start_time="08:00:00", end_time="20:30:00"),
+    )
+
+    mock_marstek_api.set_es_mode_manual.assert_called_once_with(
+        0, "08:00", "20:30", 127, 300, 1
+    )
+
+
+async def test_manual_service_accepts_unquoted_yaml_times(
+    hass, marstek_entry, mock_marstek_api
+):
+    """Unquoted YAML times from 10:00 up arrive as base-60 integers."""
+    data = parse_yaml("start_time: 08:00\nend_time: 23:59\n")
+    assert data == {"start_time": "08:00", "end_time": 1439}
+    entity_id = await _setup_model(hass, marstek_entry, mock_marstek_api, "Venus D")
+    mock_marstek_api.set_es_mode_manual.return_value = True
+
+    await _call_manual(hass, **_base_data(entity_id, **data))
+
+    mock_marstek_api.set_es_mode_manual.assert_called_once_with(
+        0, "08:00", "23:59", 127, 300, 1
+    )
+
+
+@pytest.mark.parametrize(
+    ("yaml_time", "expected"),
+    [("10:00", "10:00"), ("20:30", "20:30"), ("20:30:00", "20:30")],
+)
+async def test_unquoted_yaml_times_convert_back(yaml_time, expected):
+    value = parse_yaml(f"t: {yaml_time}")["t"]
+    assert isinstance(value, int)
+    assert _validate_hhmm(value) == expected
+
+
+@pytest.mark.parametrize(
+    "bad_time",
+    [
+        "8:00",
+        "24:00",
+        "12:60",
+        "noon",
+        "",
+        "08:00:30",
+        "08:00:",
+        "08:00:00:00",
+        90,  # Unquoted 1:30, which is not HH:MM either.
+        1440,  # Unquoted 24:00.
+        72030,  # Unquoted 20:00:30.
+        True,
+    ],
+)
 async def test_manual_service_rejects_malformed_times(
     hass, marstek_entry, mock_marstek_api, bad_time
 ):

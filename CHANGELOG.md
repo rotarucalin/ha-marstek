@@ -16,6 +16,20 @@ device left Passive even though Home Assistant still held the target.
   backoff.
 - Outside that window, degraded mode still holds the retry back as before.
 
+### Fixed: Manual service rejected times picked in the UI
+
+The time picker in the Home Assistant UI sends `HH:MM:SS`, such as
+`08:00:00`, but `marstek.set_operating_mode_manual` accepted only `HH:MM`.
+Every Manual call made from the UI failed validation.
+
+- `start_time` and `end_time` now accept `HH:MM` or `HH:MM:00`. The device
+  still receives `HH:MM`.
+- Seconds other than `00` are rejected, because the device schedules whole
+  minutes.
+- Unquoted times in YAML from `10:00` up, such as `end_time: 20:00`, are now
+  accepted too. YAML reads them as base-60 numbers (`20:00` becomes 1200), and
+  the service converts them back to `HH:MM`.
+
 ## 2.8.0.0
 
 ### Changed: Late UDP replies are correlated instead of discarded

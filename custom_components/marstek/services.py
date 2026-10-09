@@ -19,14 +19,33 @@ _LOGGER = logging.getLogger(__name__)
 SERVICE_SET_OPERATING_MODE_PASSIVE = "set_operating_mode_passive"
 SERVICE_SET_OPERATING_MODE_MANUAL = "set_operating_mode_manual"
 
-_HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+# The UI's time selector sends `HH:MM:SS`, so whole-minute seconds are accepted.
+_HHMM = re.compile(r"^(?P<hhmm>([01]\d|2[0-3]):[0-5]\d)(:00)?$")
+
+
+def _sexagesimal_to_hhmm(value: int) -> str | None:
+    """Recover a time that YAML 1.1 read as a base-60 integer.
+
+    Unquoted `20:00` loads as 1200 (minutes) and `20:00:00` as 72000 (seconds).
+    Only hours 10-23 are affected, because a leading zero keeps the string, so
+    the two forms cover the separate ranges 600-1439 and 36000-86399.
+    """
+    if 600 <= value < 1440:
+        return f"{value // 60:02d}:{value % 60:02d}"
+    if 36000 <= value < 86400 and value % 60 == 0:
+        return f"{value // 3600:02d}:{value // 60 % 60:02d}"
+    return None
 
 
 def _validate_hhmm(value: object) -> str:
-    """Validate an `HH:MM` string as manual_cfg's start_time/end_time expect."""
-    if not isinstance(value, str) or not _HHMM.match(value):
+    """Return the `HH:MM` that manual_cfg's start_time/end_time expect."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        if (hhmm := _sexagesimal_to_hhmm(value)) is not None:
+            return hhmm
+    match = _HHMM.match(value) if isinstance(value, str) else None
+    if match is None:
         raise vol.Invalid(f"'{value}' is not a valid HH:MM time")
-    return value
+    return match["hhmm"]
 
 
 SERVICE_SET_OPERATING_MODE_PASSIVE_SCHEMA = vol.Schema(

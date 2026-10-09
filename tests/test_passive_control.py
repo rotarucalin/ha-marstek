@@ -284,6 +284,24 @@ async def test_internal_keepalive_failure_never_raises_a_service_exception(
     assert command_timers.current.delay == PASSIVE_KEEPALIVE_RETRY_SECONDS[0]
 
 
+@pytest.mark.parametrize(
+    "desired,soc,expected",
+    [
+        (-500, "97", False),
+        (-500, "96", True),
+        (500, "5", False),
+        (500, "6", True),
+        (-500, 97, False),
+        (500, 5, False),
+        (500, "unknown", True),
+    ],
+)
+async def test_soc_learning_gate_reads_string_soc(coordinator, desired, soc, expected):
+    """A string `soc` must still stop learning near full or empty."""
+    battery = {"soc": soc, "charg_flag": True, "dischrg_flag": True}
+    assert coordinator._passive_headroom_available(desired, battery) is expected
+
+
 async def test_failed_initial_target_also_retries(
     coordinator, command_timers, mock_marstek_api, caplog
 ):

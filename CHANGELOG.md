@@ -30,6 +30,20 @@ Every Manual call made from the UI failed validation.
   accepted too. YAML reads them as base-60 numbers (`20:00` becomes 1200), and
   the service converts them back to `HH:MM`.
 
+### Fixed: A string battery SOC disabled the calibration SOC limits
+
+The Open API types `Bat.GetStatus` `soc` as a string. Current firmware sends a
+number, but the integration only checked numbers. With a string SOC, Passive
+calibration would keep learning while charging above 97% or discharging below
+5%. Near those limits the device may not deliver the requested power, so the
+learned offsets would be wrong.
+
+- `soc` is now read whether it arrives as a number or a numeric string, such as
+  `"97"`.
+- This applies to the calibration limits, the charging-permission check and the
+  `battery_soc` diagnostic.
+- A SOC that is not a number, such as `"unknown"`, is still ignored, as before.
+
 ## 2.8.0.0
 
 ### Changed: Late UDP replies are correlated instead of discarded

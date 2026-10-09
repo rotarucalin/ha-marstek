@@ -15,6 +15,16 @@ def numeric(value: object) -> float | None:
     return None
 
 
+def soc_value(value: object) -> float | None:
+    """Read `Bat.GetStatus` `soc`, which the Open API types as a string."""
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return None
+    return numeric(value)
+
+
 @dataclass(frozen=True)
 class PassiveTelemetry:
     """One observation; cached sections are never evidence for control."""
@@ -63,7 +73,7 @@ class PassiveTelemetry:
         if "battery" not in self.fresh:
             return None
         flag = self.battery.get("charg_flag")
-        soc = numeric(self.battery.get("soc"))
+        soc = soc_value(self.battery.get("soc"))
         if soc is None and "es" in self.fresh:
             soc = numeric(self.es.get("bat_soc"))
         if flag in (False, 0):
@@ -79,7 +89,7 @@ class PassiveTelemetry:
             "mode": self.mode.get("mode"),
             "es_power_w": numeric(self.es.get("ongrid_power")),
             "mode_power_w": numeric(self.mode.get("ongrid_power")),
-            "battery_soc": numeric(self.battery.get("soc")),
+            "battery_soc": soc_value(self.battery.get("soc")),
             "es_soc": numeric(self.es.get("bat_soc")),
             "mode_soc": numeric(self.mode.get("bat_soc")),
             "charg_flag": self.battery.get("charg_flag"),

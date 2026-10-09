@@ -2,7 +2,7 @@
 
 import pytest
 
-from custom_components.marstek.passive_telemetry import PassiveTelemetry
+from custom_components.marstek.passive_telemetry import PassiveTelemetry, soc_value
 
 
 @pytest.mark.parametrize(
@@ -59,8 +59,30 @@ def test_cached_zeros_are_not_suspect(desired):
         ({"soc": 50, "charg_flag": True}, {}, {"es"}, None),
         ({"charg_flag": True}, {"bat_soc": 50}, {"battery", "es"}, True),
         ({"charg_flag": True}, {"bat_soc": 50}, {"battery"}, None),
+        ({"soc": "50", "charg_flag": True}, {}, {"battery"}, True),
+        ({"soc": "100", "charg_flag": True}, {}, {"battery"}, False),
     ],
 )
 def test_charging_permission_requires_fresh_evidence(battery, es, fresh, expected):
     telemetry = PassiveTelemetry({}, es, battery, frozenset(fresh))
     assert telemetry.charging_permitted is expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (50, 50.0),
+        (97.5, 97.5),
+        ("50", 50.0),
+        (" 97.5 ", 97.5),
+        ("full", None),
+        ("", None),
+        ("nan", None),
+        ("inf", None),
+        (True, None),
+        (None, None),
+    ],
+)
+def test_soc_value_accepts_the_documented_string_type(value, expected):
+    """Open API 3.4 types `soc` as a string; firmware sends a number."""
+    assert soc_value(value) == expected

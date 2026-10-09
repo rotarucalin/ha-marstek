@@ -55,7 +55,7 @@ from .const import (
 from .identity import CONF_DEVICE_INFO, device_metadata, normalize_mac
 from .marstek_api import MarstekAPI
 from .passive_calibration import PassiveCalibration, bucket_center, direction_of
-from .passive_telemetry import PassiveTelemetry, numeric
+from .passive_telemetry import PassiveTelemetry, numeric, soc_value
 from .polling import ES_FRESH_SECONDS, CommandPriorityGate, PollingPolicy
 from .registry import async_repair_registry
 from .services import async_register_services
@@ -1108,9 +1108,9 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
     ) -> bool:
         """Return whether the device is free to follow the command right now."""
         battery = battery_data or {}
-        soc = battery.get("soc")
+        soc = soc_value(battery.get("soc"))
         charging = desired < 0
-        if isinstance(soc, (int, float)) and not isinstance(soc, bool):
+        if soc is not None:
             if charging and soc >= PASSIVE_SOC_LEARN_MAX:
                 return False
             if not charging and soc <= PASSIVE_SOC_LEARN_MIN:

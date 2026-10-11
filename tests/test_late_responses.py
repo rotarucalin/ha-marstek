@@ -14,6 +14,7 @@ import pytest
 from custom_components.marstek import MarstekDataUpdateCoordinator
 from custom_components.marstek.marstek_api import (
     LATE_RESPONSE_WINDOW_SECONDS,
+    MAX_COMPLETED_REQUESTS,
     MAX_RECENT_REQUESTS,
     MarstekAPI,
 )
@@ -311,3 +312,82 @@ async def test_disabled_section_ignores_late_data(coordinator, api):
     api._socket.deliver(1, {"state": "connect"})
     await coordinator._async_device_job(api.get_battery_status)
     assert "ble" not in coordinator._last_good_data
+
+
+@pytest.mark.parametrize("delay", [35.0, LATE_RESPONSE_WINDOW_SECONDS + 1])
+@pytest.mark.parametrize("duplicate_count", [1, 3])
+def test_delayed_completed_replies_are_duplicates(
+    api, clock, caplog, duplicate_count, delay
+):
+    api._request_id = 646
+    api._socket.deliver(647, {"id": 0, "ongrid_power": 100})
+    assert api.get_es_status() == {"id": 0, "ongrid_power": 100}
+    completed = api._completed_requests[647]
+    completed_at = clock.now
+    assert (completed.request_id, completed.method, completed.state) == (
+        647,
+        "ES.GetStatus",
+        "completed",
+    )
+    assert completed.completed_at == completed_at
+
+    # Include Venus delays and expiry of the separate late-response registry.
+    clock.now += delay
+    for _ in range(duplicate_count):
+        api._socket.deliver(647, {"id": 0, "ongrid_power": 999})
+    api._socket.deliver(648, {"id": 0, "pv1_power": 200})
+    assert api.get_pv_status() == {"id": 0, "pv1_power": 200}
+    assert messages(caplog, "Ignored duplicate response") == [
+        "Ignored duplicate response: response_id=647 original_method=ES.GetStatus "
+        "current_request_id=648 current_method=PV.GetStatus"
+    ] * duplicate_count
+    assert not messages(caplog, "Ignored response with unknown or expired request ID")
+    assert api.take_late_results() == {}
+    assert api._newest_read["ES.GetStatus"] == 647
+    assert completed.completed_at == completed_at
+
+
+def test_duplicates_do_not_satisfy_current_request_or_extend_deadline(api, clock, caplog):
+    api._socket.deliver(1, {"id": 0, "soc": 50})
+    assert api.get_battery_status() == {"id": 0, "soc": 50}
+    clock.now = api._next_request_at
+    started = clock.now
+    for _ in range(60):
+        api._socket.deliver(1, {"id": 0, "soc": 99})
+    api._socket.deliver(2, {"ongrid_power": 100})
+    assert api.get_es_status() is None
+    assert clock.now - started == pytest.approx(api.timeout, abs=0.1)
+    assert api._recent[2].state == "timed_out"
+    assert api.take_late_results() == {}
+    assert messages(caplog, "Ignored duplicate response")
+    assert not messages(caplog, "Accepted late response")
+
+
+def test_completed_history_evicts_oldest_without_refreshing_duplicates(api, caplog):
+    for request_id in range(1, MAX_COMPLETED_REQUESTS + 1):
+        api._socket.deliver(request_id, {"soc": request_id})
+        assert api.get_battery_status() == {"soc": request_id}
+    assert len(api._completed_requests) == MAX_COMPLETED_REQUESTS
+    api._socket.deliver(1, {"soc": 1})
+    api._socket.deliver(MAX_COMPLETED_REQUESTS + 1, {})
+    assert api.get_es_status() == {}
+    assert messages(caplog, "Ignored duplicate response")
+    assert len(api._completed_requests) == MAX_COMPLETED_REQUESTS
+    assert next(iter(api._completed_requests)) == 2
+    assert 1 not in api._completed_requests
+    api._socket.deliver(1, {"soc": 1})
+    api._socket.deliver(MAX_COMPLETED_REQUESTS + 2, {})
+    assert api.get_es_status() == {}
+    (unknown,) = messages(caplog, "Ignored response with unknown or expired request ID")
+    assert "response_id=1" in unknown
+
+
+def test_failed_reply_is_not_a_successful_duplicate(api, caplog):
+    api._socket.deliver(1, error={"code": -1, "message": "busy"})
+    assert api.get_battery_status() is None
+    assert api._completed_requests[1].state == "failed"
+    api._socket.deliver(1, {"soc": 50})
+    api._socket.deliver(2, {})
+    assert api.get_es_status() == {}
+    assert messages(caplog, "Ignored response with unknown or expired request ID")
+    assert not messages(caplog, "Ignored duplicate response")

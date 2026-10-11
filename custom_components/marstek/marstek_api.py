@@ -21,6 +21,8 @@ REQUEST_GAP_SECONDS = 2.5
 # Replies to timed-out requests are still correlated within this bounded window.
 LATE_RESPONSE_WINDOW_SECONDS = 120.0
 MAX_RECENT_REQUESTS = 64
+# Keep completion history independent of the late-response correlation window.
+MAX_COMPLETED_REQUESTS = 128
 # A mode write supersedes control telemetry requested before it.
 CONTROL_READ_METHODS = frozenset({"ES.GetStatus", "ES.GetMode", "Bat.GetStatus"})
 
@@ -41,6 +43,7 @@ class RecentRequest:
     endpoint: tuple[str, int]
     kind: str  # "read" or "write"
     state: str = STATE_PENDING
+    completed_at: float | None = None
 
 
 class MarstekAPI:
@@ -60,6 +63,7 @@ class MarstekAPI:
         # Guards correlation state, which the event loop also reads.
         self._state_lock = Lock()
         self._recent: OrderedDict[int, RecentRequest] = OrderedDict()
+        self._completed_requests: OrderedDict[int, RecentRequest] = OrderedDict()
         # Per read method: newest request whose data was accepted, and the
         # request at or below which late data is obsolete (invalidated).
         self._newest_read: dict[str, int] = {}
@@ -150,6 +154,10 @@ class MarstekAPI:
         if entry is not None:
             with self._state_lock:
                 entry.state = state
+                entry.completed_at = monotonic()
+                self._completed_requests[entry.request_id] = entry
+                while len(self._completed_requests) > MAX_COMPLETED_REQUESTS:
+                    self._completed_requests.popitem(last=False)
 
     def _record_read(self, method: str, request_id: int) -> None:
         """Note fresh data, discarding an older late reply not yet collected."""
@@ -209,6 +217,23 @@ class MarstekAPI:
             return
 
         now = monotonic()
+        with self._state_lock:
+            completed = self._completed_requests.get(response_id)
+        if (
+            completed is not None
+            and completed.state == STATE_COMPLETED
+            and completed.endpoint[0] == sender
+        ):
+            _LOGGER.debug(
+                "Ignored duplicate response: response_id=%s original_method=%s "
+                "current_request_id=%s current_method=%s",
+                response_id,
+                completed.method,
+                request["id"],
+                request["method"],
+            )
+            return
+
         newer_id = None
         with self._state_lock:
             self._prune_recent(now)
@@ -366,7 +391,9 @@ class MarstekAPI:
                     break
                 self._handle_unmatched(response, addr[0], request)
 
-            self._finish_request(entry, STATE_COMPLETED)
+            self._finish_request(
+                entry, STATE_FAILED if "error" in response else STATE_COMPLETED
+            )
             _LOGGER.debug(
                 "Marstek RX: host=%s method=%s request_id=%s response=%s",
                 self.host,

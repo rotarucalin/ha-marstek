@@ -1,5 +1,21 @@
 # Changelog
 
+## v2.9.0.0 — 2026-10-11
+
+### Fixed: Respect battery charging limits at high SOC
+
+When SOC is at least 80% and the battery still reports Passive mode, reduced
+charging power (including 0 W) is treated as an expected firmware/BMS limit.
+The integration stops retrying or increasing the command solely to correct
+this charging shortfall, preserves the user's desired power, maintains normal
+keepalives, and allows polling to return to its normal profile. A rate-limited
+log explains the limitation.
+
+Charging samples at or above 80% SOC are excluded from calibration learning;
+existing learned calibration is preserved. Normal recovery still applies to
+mode changes, missing or stale SOC, failed commands, new targets, and SOC below
+80%. Discharge handling is unchanged.
+
 ## 2.8.1.0
 
 ### Fixed: Passive control could lapse while the API was degraded

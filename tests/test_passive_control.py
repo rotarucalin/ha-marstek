@@ -26,10 +26,10 @@ from custom_components.marstek.const import (
     CONF_PASSIVE_KEEPALIVE_SECONDS,
     DEFAULT_PASSIVE_KEEPALIVE_SECONDS,
     DOMAIN,
+    HIGH_SOC_CHARGE_LIMIT_THRESHOLD,
     PASSIVE_COMMAND_MAX,
     PASSIVE_DEADBAND_W,
     PASSIVE_SETTLE_SECONDS,
-    PASSIVE_SOC_LEARN_MAX,
     PASSIVE_SOC_LEARN_MIN,
     PASSIVE_STABILITY_SAMPLES,
     SOURCE_CALIBRATION,
@@ -288,7 +288,9 @@ async def test_internal_keepalive_failure_never_raises_a_service_exception(
     "desired,soc,expected",
     [
         (-500, "97", False),
-        (-500, "96", True),
+        (-500, "96", False),
+        (-500, "79", True),
+        (-500, "80", False),
         (500, "5", False),
         (500, "6", True),
         (-500, 97, False),
@@ -1068,7 +1070,7 @@ async def test_validity_gate_blocks_learning(
         battery = {"soc": PASSIVE_SOC_LEARN_MIN}
     elif gate == "soc_blocked_charge":
         desired = -240
-        battery = {"soc": PASSIVE_SOC_LEARN_MAX}
+        battery = {"soc": HIGH_SOC_CHARGE_LIMIT_THRESHOLD}
         actual_values = [-205, -205, -205]
     elif gate == "unstable_samples":
         actual_values = [180, 230, 180]
@@ -1681,3 +1683,163 @@ async def test_duplicate_target_preserves_keepalive_and_new_target_replaces_it(
         call(240), call(300), call(300)
     ]
     assert command_timers.current.delay == replacement.delay
+
+
+@pytest.mark.parametrize("soc", [80, 94, 100, "80", "94", "100"])
+@pytest.mark.parametrize("actual", [-449, 0])
+async def test_high_soc_charge_shortfall_preserves_target_calibration_and_keepalive(
+    coordinator, command_timers, mock_marstek_api, clock, caplog, soc, actual
+):
+    coordinator.calibration.observe(-800, -800, -813)
+    await coordinator.async_set_passive_power(-800)
+    assert coordinator.command_power == -787
+    original = coordinator.calibration_snapshot()
+    keepalive = command_timers.current
+    mock_marstek_api.reset_mock()
+    clock.advance(PASSIVE_SETTLE_SECONDS + 1)
+    with patch.object(
+        coordinator, "_async_compensate", wraps=coordinator._async_compensate
+    ) as compensate:
+        for _ in range(PASSIVE_STABILITY_SAMPLES + 1):
+            assert not await coordinator._async_verify_passive_power(
+                {"mode": "Passive", "ongrid_power": actual},
+                es_data={"ongrid_power": actual},
+                battery_data={"soc": soc, "charg_flag": float(soc) < 100},
+                fresh=frozenset({"es_mode", "es", "battery"}),
+                confirmed_drop=True,
+            )
+        compensate.assert_not_awaited()
+    mock_marstek_api.set_es_mode_passive.assert_not_called()
+    assert coordinator.desired_power == -800
+    assert coordinator.command_power == -787
+    assert coordinator.calibration_snapshot() == original
+    assert not coordinator._passive_samples
+    assert coordinator.passive_power_state == "acknowledged"
+    assert command_timers.current is keepalive
+    assert caplog.text.count("Marstek charging limited by battery:") == 1
+    await keepalive.fire()
+    mock_marstek_api.set_es_mode_passive.assert_called_once_with(-787)
+
+
+@pytest.mark.parametrize("soc", [80, 94, "80", "94"])
+@pytest.mark.parametrize("actual", [-800, -900])
+async def test_high_soc_charging_never_learns_even_without_shortfall(
+    coordinator, clock, soc, actual
+):
+    await coordinator.async_set_passive_power(-800)
+    clock.advance(PASSIVE_SETTLE_SECONDS + 1)
+    for _ in range(PASSIVE_STABILITY_SAMPLES + 1):
+        await coordinator._async_verify_passive_power(
+            {"mode": "Passive", "ongrid_power": actual},
+            es_data={"ongrid_power": actual},
+            battery_data={"soc": soc, "charg_flag": True},
+            fresh=frozenset({"es_mode", "es", "battery"}),
+        )
+    assert coordinator.calibration.is_empty
+    assert not coordinator._passive_samples
+
+
+@pytest.mark.parametrize(
+    "reported_mode,actual",
+    [("Auto", -449), ("Manual", -449), ("Auto", 0), ("Manual", 0), ("Passive", 449)],
+)
+async def test_high_soc_other_modes_or_direction_still_recover_passive(
+    coordinator, mock_marstek_api, clock, reported_mode, actual
+):
+    await coordinator.async_set_passive_power(-800)
+    mock_marstek_api.reset_mock()
+    clock.advance(PASSIVE_SETTLE_SECONDS + 1)
+    assert await coordinator._async_verify_passive_power(
+        {"mode": reported_mode, "ongrid_power": actual},
+        es_data={"ongrid_power": actual},
+        battery_data={"soc": 94, "charg_flag": True},
+        fresh=frozenset({"es_mode", "es", "battery"}),
+        confirmed_drop=True,
+    )
+    mock_marstek_api.set_es_mode_passive.assert_called_once_with(-800)
+    assert coordinator._last_passive_command["source"] == "verification_retry"
+
+
+@pytest.mark.parametrize(
+    "soc,fresh",
+    [
+        (79, frozenset({"es_mode", "es", "battery"})),
+        (None, frozenset({"es_mode", "es", "battery"})),
+        (94, frozenset({"es_mode", "es"})),
+    ],
+)
+async def test_high_soc_exception_requires_fresh_high_soc(
+    coordinator, mock_marstek_api, clock, soc, fresh
+):
+    coordinator.calibration.observe(-800, -800, -813)
+    await coordinator.async_set_passive_power(-800)
+    mock_marstek_api.reset_mock()
+    clock.advance(PASSIVE_SETTLE_SECONDS + 1)
+    await coordinator._async_verify_passive_power(
+        {"mode": "Passive", "ongrid_power": -449},
+        es_data={"ongrid_power": -449},
+        battery_data={"soc": soc, "charg_flag": True},
+        fresh=fresh,
+    )
+    assert coordinator.passive_power_state != "acknowledged"
+    if soc == 79:
+        mock_marstek_api.set_es_mode_passive.assert_called_once_with(-787)
+    # Missing SOC/permission retains the existing conservative recovery gate.
+
+
+@pytest.mark.parametrize("desired,soc", [(-800, 79), (-800, "79"), (800, 94)])
+async def test_low_soc_charging_and_high_soc_discharge_still_compensate(
+    coordinator, clock, desired, soc
+):
+    await coordinator.async_set_passive_power(desired)
+    clock.advance(PASSIVE_SETTLE_SECONDS + 1)
+    original = coordinator.calibration_snapshot()
+    for _ in range(PASSIVE_STABILITY_SAMPLES):
+        await coordinator._async_verify_passive_power(
+            {"mode": "Passive", "ongrid_power": desired / 2},
+            es_data={"ongrid_power": desired / 2},
+            battery_data={"soc": soc, "charg_flag": True, "dischrg_flag": True},
+            fresh=frozenset({"es_mode", "es", "battery"}),
+        )
+        clock.advance(1)
+    assert coordinator.calibration_snapshot() != original
+    assert coordinator._last_passive_command["source"] == "compensation"
+    assert abs(coordinator.command_power) > abs(desired)
+
+
+async def test_high_soc_exception_exits_and_accepts_new_targets(
+    coordinator, mock_marstek_api, clock
+):
+    await coordinator.async_set_passive_power(-800)
+    clock.advance(PASSIVE_SETTLE_SECONDS + 1)
+    for soc in (94, 79, 94):
+        sent = await coordinator._async_verify_passive_power(
+            {"mode": "Passive", "ongrid_power": -449},
+            es_data={"ongrid_power": -449},
+            battery_data={"soc": soc, "charg_flag": True},
+            fresh=frozenset({"es_mode", "es", "battery"}),
+        )
+        assert sent is (soc == 79)
+    assert coordinator._last_passive_command["source"] == "verification_retry"
+    for desired in (-900, 800):
+        assert await coordinator.async_set_passive_power(desired)
+        mock_marstek_api.set_es_mode_passive.assert_called_with(desired)
+        assert coordinator._last_passive_command["source"] == "new_target"
+
+
+async def test_high_soc_failed_command_still_retries(
+    coordinator, command_timers, mock_marstek_api
+):
+    mock_marstek_api.set_es_mode_passive.return_value = False
+    assert not await coordinator.async_set_passive_power(-800)
+    retry = command_timers.current
+    await coordinator._async_verify_passive_power(
+        {"mode": "Passive", "ongrid_power": -449},
+        es_data={"ongrid_power": -449},
+        battery_data={"soc": 94, "charg_flag": True},
+        fresh=frozenset({"es_mode", "es", "battery"}),
+    )
+    assert command_timers.current is retry
+    mock_marstek_api.set_es_mode_passive.return_value = True
+    await retry.fire()
+    assert coordinator._last_passive_command["source"] == "new_target_retry"

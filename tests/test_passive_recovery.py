@@ -222,7 +222,6 @@ async def test_missing_status_is_unknown_but_missing_mode_only_blocks_learning(
     [
         ({"soc": 50, "charg_flag": False}, True),
         ({"soc": 50, "charg_flag": 0}, True),
-        ({"soc": 100, "charg_flag": True}, True),
         ({"soc": 50}, False),
         ({"soc": 50, "charg_flag": None}, False),
         ({"charg_flag": True}, False),
@@ -553,3 +552,51 @@ async def test_unknown_permission_after_recovery_preserves_keepalive(
     assert coordinator.passive_power_state == "sent"
     assert "recovery_blocked" not in [event["phase"] for event in observations(caplog)]
     assert "charging permission unknown; preserving keepalive" in caplog.text
+
+
+@pytest.mark.parametrize("actual", [-449, 0])
+async def test_high_soc_charge_limit_returns_to_normal_polling(
+    recovery, actual, caplog
+):
+    coordinator, api, clock = recovery
+    api.get_battery_status.return_value = {"soc": 94, "charg_flag": True}
+    api.get_es_status.return_value = status(actual)
+    api.get_es_mode.return_value = mode(actual)
+    keepalive = coordinator._passive_keepalive_cancel
+    original = coordinator.calibration_snapshot()
+    coordinator._require_mode_verification()
+    await coordinator.async_refresh()
+    assert coordinator._polling.profile == "normal"
+    assert coordinator.passive_power_state == "acknowledged"
+    assert api.get_es_status.call_count == api.get_es_mode.call_count == 1
+    assert not observations(caplog)
+    assert coordinator._passive_keepalive_cancel is keepalive
+    # Follow actual 30s coordinator ticks, including intentionally skipped
+    # battery/mode reads, so a mismatch cannot repeatedly reactivate polling.
+    for _ in range(8):
+        clock.now += 30
+        await coordinator._async_update_data()
+        assert coordinator._polling.profile == "normal"
+        assert coordinator.passive_power_state == "acknowledged"
+    api.set_es_mode_passive.assert_not_called()
+    assert coordinator.calibration_snapshot() == original
+    assert not coordinator._passive_samples
+
+
+@pytest.mark.parametrize("failure", ["missing_soc", "failed_battery", "stale_battery"])
+async def test_high_soc_charge_limit_does_not_survive_invalid_soc(recovery, failure):
+    coordinator, api, clock = recovery
+    api.get_battery_status.return_value = {"soc": 94, "charg_flag": True}
+    api.get_es_status.return_value = status(-449)
+    api.get_es_mode.return_value = mode(-449)
+    await coordinator.async_refresh()
+    assert coordinator.passive_power_state == "acknowledged"
+    if failure == "missing_soc":
+        api.get_battery_status.return_value = {"charg_flag": True}
+    else:
+        api.get_battery_status.return_value = None
+    if failure == "stale_battery":
+        # Simulate an intentional skip with a reading older than its interval.
+        coordinator._polling.sections["battery"].next_poll = clock.now + 1000
+    await coordinator.async_refresh()
+    assert coordinator.passive_power_state != "acknowledged"

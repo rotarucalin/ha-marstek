@@ -28,6 +28,7 @@ from .const import (
     DEFAULT_MAX_PASSIVE_POWER,
     DEFAULT_PASSIVE_KEEPALIVE_SECONDS,
     DOMAIN,
+    HIGH_SOC_CHARGE_LIMIT_THRESHOLD,
     MODE_AI,
     MODE_AUTO,
     MODE_MANUAL,
@@ -39,7 +40,6 @@ from .const import (
     PASSIVE_RESEND_THRESHOLD_W,
     PASSIVE_SAVE_DELAY_SECONDS,
     PASSIVE_SETTLE_SECONDS,
-    PASSIVE_SOC_LEARN_MAX,
     PASSIVE_SOC_LEARN_MIN,
     PASSIVE_STABILITY_SAMPLES,
     PASSIVE_STABILITY_TOLERANCE_W,
@@ -251,6 +251,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._last_passive_command: dict | None = None
         self._passive_poll_active = False
         self._passive_charge_recovery_blocked = False
+        self._high_soc_charge_limit_logged_at: float | None = None
         self._calibration_store = store
         # The option is the ceiling the user asked for; the model's own
         # hardware rating (capabilities.passive_power_range) can only tighten
@@ -1024,10 +1025,11 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             await self._async_send_passive_power(PASSIVE_STATE_SENT, source=source)
 
     def _passive_power_is_confirmed(self, telemetry: PassiveTelemetry) -> bool:
-        """Return whether ES status confirms the desired real output.
+        """Return whether output meets the target or a known battery limit.
 
         Compensation aims the measurement at the desired value, so confirmation
         keeps comparing against what was requested rather than what was sent.
+        High-SOC charging shortfalls also settle control while preserving the target.
         """
         if self._passive_desired_power is None:
             return False
@@ -1040,7 +1042,49 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             abs(self._passive_desired_power) * PASSIVE_POWER_TOLERANCE,
             PASSIVE_POWER_ZERO_TOLERANCE,
         )
-        return abs(reported_power - self._passive_desired_power) <= tolerance
+        return abs(
+            reported_power - self._passive_desired_power
+        ) <= tolerance or self._passive_charge_is_limited(telemetry)
+
+    def _passive_charge_is_limited(self, telemetry: PassiveTelemetry) -> bool:
+        """Recognize BMS charge tapering using current power, mode and SOC."""
+        desired = self._passive_desired_power
+        command = self._passive_command_power
+        actual = telemetry.power("es")
+        if (
+            desired is None
+            or desired >= 0
+            or command is None
+            or command >= 0
+            or not self._passive_last_send_ok
+            or actual is None
+            or not max(desired, command) < actual <= 0
+        ):
+            return False
+
+        # Battery and mode are intentionally polled less often than power.
+        # Reuse them only within their normal interval, after this target,
+        # and never after a failed read. Learning still requires fresh reads.
+        evidence = {}
+        for key, data in (("battery", telemetry.battery), ("es_mode", telemetry.mode)):
+            if key in telemetry.fresh:
+                evidence[key] = data
+                continue
+            state = self._polling.sections[key]
+            if (
+                state.consecutive_failures
+                or state.last_success is None
+                or state.last_success < self._passive_command_changed_at
+                or monotonic() - state.last_success >= state.interval
+            ):
+                return False
+            evidence[key] = self._last_good_data.get(key, {})
+        soc = soc_value(evidence["battery"].get("soc"))
+        return (
+            soc is not None
+            and soc >= HIGH_SOC_CHARGE_LIMIT_THRESHOLD
+            and evidence["es_mode"].get("mode") == MODE_PASSIVE
+        )
 
     def _cached_passive_output(self) -> PassiveTelemetry:
         """Reuse a recent successful status read, independently of mode health."""
@@ -1111,7 +1155,7 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         soc = soc_value(battery.get("soc"))
         charging = desired < 0
         if soc is not None:
-            if charging and soc >= PASSIVE_SOC_LEARN_MAX:
+            if charging and soc >= HIGH_SOC_CHARGE_LIMIT_THRESHOLD:
                 return False
             if not charging and soc <= PASSIVE_SOC_LEARN_MIN:
                 return False
@@ -1161,6 +1205,32 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 self._set_passive_power_state(PASSIVE_STATE_ACKNOWLEDGED)
             else:
                 self._set_passive_power_state(PASSIVE_STATE_SENT)
+            if self._passive_charge_is_limited(telemetry):
+                self._passive_samples.clear()
+                if self._passive_charge_recovery_blocked:
+                    self._passive_charge_recovery_blocked = False
+                    self._schedule_passive_keepalive(source="keepalive")
+                now = monotonic()
+                if (
+                    self._high_soc_charge_limit_logged_at is None
+                    or now - self._high_soc_charge_limit_logged_at >= 300
+                ):
+                    self._high_soc_charge_limit_logged_at = now
+                    battery = (
+                        telemetry.battery
+                        if "battery" in fresh
+                        else self._last_good_data.get("battery", {})
+                    )
+                    _LOGGER.info(
+                        "Marstek charging limited by battery: soc=%s%% "
+                        "desired=%sW command=%sW actual=%sW device=%s",
+                        battery.get("soc"),
+                        self._passive_desired_power,
+                        self._passive_command_power,
+                        telemetry.power("es"),
+                        self.entry.title,
+                    )
+                return False
             # Endpoint agreement remains a calibration/recovery safeguard only.
             # ES.GetMode cannot veto acknowledgement of the measured output.
             actual = telemetry.actual
@@ -1215,7 +1285,13 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
                 # of retries or learn from a recovery/settling observation.
                 return False
 
-            if not interrupted:
+            if (
+                self._passive_desired_power < 0
+                and (soc := soc_value((battery_data or {}).get("soc"))) is not None
+                and soc >= HIGH_SOC_CHARGE_LIMIT_THRESHOLD
+            ):
+                self._passive_samples.clear()
+            elif not interrupted:
                 self._passive_samples.append((monotonic(), actual))
 
             if not interrupted and await self._async_compensate(

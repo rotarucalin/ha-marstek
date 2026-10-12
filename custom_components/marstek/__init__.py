@@ -12,12 +12,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_LOGGING_CHANGED, Platform
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.storage import Store
+from homeassistant.helpers.typing import ConfigType
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.loader import async_get_integration
 
 from .capabilities import MarstekCapabilities, resolve_capabilities
 from .const import (
@@ -102,6 +104,28 @@ class PassiveCommandRetry:
     source: str
     delay_seconds: int = 0
     cancel: Callable[[], None] | None = None
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register one debug announcement listener for the whole integration."""
+    integration = await async_get_integration(hass, DOMAIN)
+    debug_active = False
+
+    @callback
+    def async_logging_changed(event: Event | None = None) -> None:
+        """Announce each transition to debug logging, including at startup."""
+        nonlocal debug_active
+        enabled = _LOGGER.isEnabledFor(logging.DEBUG)
+        if enabled and not debug_active:
+            _LOGGER.debug(
+                "Debug info active - Marstek integration version %s",
+                integration.version,
+            )
+        debug_active = enabled
+
+    hass.bus.async_listen(EVENT_LOGGING_CHANGED, async_logging_changed)
+    async_logging_changed()
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

@@ -1,5 +1,23 @@
 # Changelog
 
+## v2.9.1.0 — 2026-10-12
+
+### Added: Integration version in debug logs
+
+Enabling debug logging in Home Assistant now logs one line stating that debug
+info is active and showing the installed Marstek integration version. The
+version is read from the integration manifest.
+
+The announcement appears once per debug session across all configured batteries.
+It also appears if debug is already enabled at startup. Turning debug off and
+back on produces a new announcement; unrelated logging changes do not repeat it.
+
+### Improved: Duplicate UDP response diagnostics
+
+Responses to already completed UDP requests are now identified as duplicates
+in debug logs, rather than being reported as unknown or expired request IDs.
+Duplicate responses are still ignored.
+
 ## v2.9.0.0 — 2026-10-11
 
 ### Fixed: Respect battery charging limits at high SOC

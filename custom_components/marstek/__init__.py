@@ -237,8 +237,13 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
         self._capabilities = resolve_capabilities(self.device_info.get("device"))
         self._last_good_data: dict = {}
         self._missing_cycles: dict[str, int] = {}
+        self._api_health_listeners: list[Callable[[], None]] = []
+        self._api_degraded_since: datetime | None = None
         self._polling = PollingPolicy(
-            entry.title, intervals=poll_intervals, backoff_caps=backoff_caps
+            entry.title,
+            intervals=poll_intervals,
+            backoff_caps=backoff_caps,
+            on_health_change=self._api_health_changed,
         )
         self._io_gate = CommandPriorityGate()
         self._fresh_sections: set[str] = set()
@@ -402,6 +407,39 @@ class MarstekDataUpdateCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(
                 "No valid Marstek BLE MAC available; retrying device setup"
             )
+
+    @property
+    def api_degraded(self) -> bool:
+        """Return the polling layer's global API health circuit breaker state."""
+        return self._polling.degraded
+
+    def api_health_attributes(self) -> dict:
+        """Describe API health from state the polling layer already keeps."""
+        return {
+            "health_state": "degraded" if self._polling.degraded else "healthy",
+            "failing_endpoints": self._polling.failing_endpoints,
+            "recent_failure_count": self._polling.recent_failure_count,
+            "degraded_since": (
+                None
+                if self._api_degraded_since is None
+                else self._api_degraded_since.isoformat()
+            ),
+        }
+
+    @callback
+    def async_add_api_health_listener(
+        self, listener: Callable[[], None]
+    ) -> Callable[[], None]:
+        """Notify on API health transitions, independently of data updates."""
+        self._api_health_listeners.append(listener)
+        return lambda: self._api_health_listeners.remove(listener)
+
+    def _api_health_changed(self) -> None:
+        self._api_degraded_since = (
+            datetime.now(UTC) if self._polling.degraded else None
+        )
+        for listener in list(self._api_health_listeners):
+            listener()
 
     @property
     def passive_power_state(self) -> str:

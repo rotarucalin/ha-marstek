@@ -168,6 +168,19 @@ sign of `sensor.marstek_battery_power` for that. Installations that already have
 these entities keep their entity IDs (shown above). New installations derive
 the entity IDs from the new names.
 
+- `binary_sensor.<device>_api_degraded` - **API degraded** (diagnostic), for
+  example `binary_sensor.venus_a_battery_system_api_degraded`: on while the
+  integration's API health is degraded, off while it is healthy
+
+API degraded mirrors the existing health state behind the
+`Marstek API health: healthy -> degraded` debug logs. It changes as soon as
+health changes, sends no requests of its own, and stays available during a
+complete outage. Attributes: `health_state`, `failing_endpoints`,
+`recent_failure_count` and `degraded_since`. Use it to avoid issuing control
+commands while communication cannot be trusted. It is independent of
+`sensor.marstek_passive_power_state`, which still reports whether a specific
+Passive command was acknowledged.
+
 ### Controls
 
 - `select.marstek_operating_mode` - Select operating mode (Auto/AI/Manual/Passive)

@@ -12,6 +12,7 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntityDescription,
 )
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -72,6 +73,7 @@ async def async_setup_entry(
     entities = []
     for description in BINARY_SENSOR_TYPES:
         entities.append(MarstekBinarySensor(coordinator, description))
+    entities.append(MarstekApiDegradedBinarySensor(coordinator))
 
     async_add_entities(entities)
 
@@ -113,3 +115,37 @@ class MarstekBinarySensor(MarstekEntity, BinarySensorEntity):
             return self.entity_description.value_fn(data)
 
         return None
+
+
+class MarstekApiDegradedBinarySensor(MarstekEntity, BinarySensorEntity):
+    """Global API health from the polling layer, independent of Passive ack."""
+
+    _attr_has_entity_name = True
+    _attr_name = "API degraded"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: MarstekDataUpdateCoordinator) -> None:
+        """Initialize the API health sensor."""
+        super().__init__(coordinator, "api_degraded")
+
+    async def async_added_to_hass(self) -> None:
+        """Publish health transitions immediately, including mid-poll ones."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self.coordinator.async_add_api_health_listener(self.async_write_ha_state)
+        )
+
+    @property
+    def available(self) -> bool:
+        """Stay available so automations can see a complete API outage."""
+        return True
+
+    @property
+    def is_on(self) -> bool:
+        """Return true while the API health circuit breaker is open."""
+        return self.coordinator.api_degraded
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Return the health details the polling layer already tracks."""
+        return self.coordinator.api_health_attributes()

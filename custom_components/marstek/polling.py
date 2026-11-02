@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -61,8 +62,10 @@ class PollingPolicy:
         *,
         intervals: dict[str, float] | None = None,
         backoff_caps: dict[str, float] | None = None,
+        on_health_change: Callable[[], None] | None = None,
     ) -> None:
         self.device = device
+        self._on_health_change = on_health_change
         self.sections: dict[str, SectionSchedule] = {}
         for key, (_, interval, cap) in ENDPOINTS.items():
             interval = (intervals or {}).get(key, interval)
@@ -217,6 +220,7 @@ class PollingPolicy:
                 )
                 self.degraded = False
                 self._failures.clear()
+                self._health_changed()
             return
         self._successes = 0
         self._success_since = None
@@ -235,6 +239,20 @@ class PollingPolicy:
                 len(self._failures),
                 HEALTH_WINDOW,
             )
+            self._health_changed()
+
+    @property
+    def failing_endpoints(self) -> list[str]:
+        """Endpoints with a failure still inside the health window."""
+        return sorted({key for _, key in self._failures})
+
+    @property
+    def recent_failure_count(self) -> int:
+        return len(self._failures)
+
+    def _health_changed(self) -> None:
+        if self._on_health_change is not None:
+            self._on_health_change()
 
 
 class CommandPriorityGate:

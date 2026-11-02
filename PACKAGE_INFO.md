@@ -14,7 +14,7 @@ This is a complete, production-ready Home Assistant custom integration for Marst
 4. **config_flow.py** - Configuration flow for UI setup
 5. **marstek_api.py** - Complete API implementation for Marstek devices
 6. **sensor.py** - All sensor entities (22 sensors)
-7. **binary_sensor.py** - Binary sensor entities (4 sensors)
+7. **binary_sensor.py** - Binary sensor entities (5 sensors)
 8. **select.py** - Operating mode selection
 9. **number.py** - Power control for Passive mode
 10. **strings.json** - UI strings and translations
@@ -101,11 +101,12 @@ logs its name once.
 **Network (1):**
 - WiFi Signal Strength (dBm)
 
-### Binary Sensors (4 total)
+### Binary Sensors (5 total)
 - Charging Allowed (permission flag, not activity)
 - Discharging Allowed (permission flag, not activity)
 - Bluetooth Connected
 - CT Connected
+- API degraded (diagnostic; global API health)
 
 ### Controls (2 total)
 - Operating Mode Select (Auto/AI/Manual/Passive)
@@ -328,6 +329,6 @@ For detailed instructions, see INSTALLATION.md and README.md.
 
 ---
 
-**Package Version:** 2.9.1.0\
+**Package Version:** 2.9.2.0\
 **API Version:** Rev 3.1
-**Last Updated:** October 12, 2026
+**Last Updated:** November 2, 2026

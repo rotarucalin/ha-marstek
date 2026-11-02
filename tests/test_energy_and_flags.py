@@ -129,5 +129,5 @@ async def test_permission_flag_metadata(hass, marstek_entry, mock_marstek_api):
                 if entry.domain == "binary_sensor"
             ]
         )
-        == 4
+        == 5
     )

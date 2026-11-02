@@ -1,5 +1,25 @@
 # Changelog
 
+## v2.9.2.0 — 2026-11-02
+
+### Added: API degraded binary sensor
+
+A new diagnostic binary sensor, **API degraded**, shows the integration's
+existing global API health: on while degraded, off while healthy. It mirrors
+the state behind the `Marstek API health: healthy -> degraded` and
+`degraded -> healthy` debug logs, rather than computing health separately.
+
+The sensor changes as soon as health changes, without waiting for the next
+poll. It sends no requests of its own and stays available during a complete
+outage, so automations can still see that communication is degraded.
+Attributes: `health_state`, `failing_endpoints`, `recent_failure_count` and
+`degraded_since`.
+
+Automations can use it to avoid issuing control commands while communication
+cannot be trusted. It is independent of Passive Power State, which still
+reports whether a specific Passive command was acknowledged. Degradation
+thresholds, recovery, backoff, polling and command behaviour are unchanged.
+
 ## v2.9.1.0 — 2026-10-12
 
 ### Added: Integration version in debug logs
